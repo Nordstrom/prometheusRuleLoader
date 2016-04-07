@@ -96,7 +96,7 @@ func updateRules(mapLocation string, rulesLocation string) {
 
 	err = CheckRules(rulesToWrite)
 	if err != nil {
-		log.Fatalf("Generated rules do not pass: %s \n----- \n%s\n", err, rulesToWrite)
+		log.Fatalf("Generated rules do not pass: %s.\n%s\n", err, rulesToWrite)
 	}
 
 	f, err := os.Create(rulesLocation)
@@ -124,7 +124,7 @@ func processRule(file string) (string, error) {
 
 	err := CheckRules(configManager.Get())
 	if err != nil {
-		return "", fmt.Errorf("Rule rejected: %s.\nReason: %s\n", file, err)
+		return "", fmt.Errorf("Rule rejected: %s. Reason: %s\n", file, err)
 	}
 	log.Printf("Rule passed!\n")
 	return configManager.Get(), nil
