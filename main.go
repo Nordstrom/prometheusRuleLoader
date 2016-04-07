@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,12 +15,20 @@ import (
 
 var (
 	// FLAGS
-	mapLocation   = flag.String("map", os.Getenv("CONFIG_MAP_LOCATION"), "Location of the config map mount.")
-	rulesLocation = flag.String("rules", os.Getenv("RULES_LOCATION"), "Filename where the rules file should be written.")
+	mapLocation    = flag.String("map", os.Getenv("CONFIG_MAP_LOCATION"), "Location of the config map mount.")
+	rulesLocation  = flag.String("rules", os.Getenv("RULES_LOCATION"), "Filename where the rules file should be written.")
+	reloadEndpoint = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
+
+	helpFlag = flag.Bool("help", true, "")
 )
 
 func main() {
 	flag.Parse()
+
+	if *helpFlag {
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
 
 	log.Printf("Rule Updater loaded.\n")
 	log.Printf("ConfigMap location: %s\n", *mapLocation)
@@ -27,11 +36,12 @@ func main() {
 
 	// load base config
 	updateRules(*mapLocation, *rulesLocation)
-
+	reloadRules(*reloadEndpoint)
 	// setup file watcher, will trigger whenever the configmap updates
 	watcher, err := WatchFile(*mapLocation, time.Second, func() {
 		log.Printf("Configuration files updated.\n")
 		updateRules(*mapLocation, *rulesLocation)
+		reloadRules(*reloadEndpoint)
 	})
 	if err != nil {
 		log.Fatalf("Unable to watch ConfigMap: %s\n", err)
@@ -118,4 +128,21 @@ func processRule(file string) (string, error) {
 	}
 	log.Printf("Rule passed!\n")
 	return configManager.Get(), nil
+}
+
+func reloadRules(url string) {
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Unable to reload Prometheus config: %s\n", err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		log.Printf("Prometheus configuration reloaded.")
+	} else {
+		respBody, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
+	}
+
 }
