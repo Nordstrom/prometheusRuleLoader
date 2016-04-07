@@ -1,0 +1,8 @@
+    ALERT DiskFilling
+    IF (container_fs_usage_bytes{id="/"} / container_fs_limit_bytes{id="/"})*100 > 80.0
+    FOR 5m
+    LABELS { severity = "critical" }
+    ANNOTATIONS {
+      summary = "Disk {{ $labels.device }} on host {{ $labels.instance }} filling up.",
+      description = "Disk {{ $labels.device }} on host {{ $labels.instance }} ({{ $labels.aws_amazon_com_instance_id }}) is filling up. Disk is {{ $value }} full at the time of alerting."
+    }

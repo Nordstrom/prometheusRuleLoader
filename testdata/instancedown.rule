@@ -1,0 +1,8 @@
+ALERT InstanceDown
+    IF up{kubernetes_role="node"} == 0
+    FOR 5m
+    LABELS { severity = "critical" }
+    ANNOTATIONS { 
+      summary = "Instance {{ $labels.instance }} down.",
+      description = "{{ $labels.instance }} ({{ $labels.aws_amazon_com_instance_id }}) has been down for more than five minutes.",
+    }

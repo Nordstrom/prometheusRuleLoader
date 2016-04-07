@@ -1,0 +1,10 @@
+    ALERT HighLoad
+      IF (node_load1{instance="localhost:9100"} > 8.0)
+      FOR 1m
+      LABELS { severity = "critical" }
+      ANNOTATIONS {
+        summary = "Load is high {{ $value }}.",
+        description = "Description",
+        title = "Load is high {{ $value }}.",
+        text = "Description"
+      }
