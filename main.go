@@ -32,8 +32,6 @@ var (
 	serviceRulesLocation   = flag.String("svrules", os.Getenv("SV_RULES_LOCATION"), "Filename where the rules from the services should be written.")
 	reloadEndpoint         = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
 
-	cluster = flag.Bool("use-kubernetes-cluster-service", true, "If true, use the built in kube cluster for creating the client.")
-
 	helpFlag = flag.Bool("help", false, "")
 
 	lastSvcSha = ""
@@ -51,7 +49,11 @@ const (
 func main() {
 	flag.Parse()
 
-	if *helpFlag {
+	if *helpFlag ||
+		*mapLocation == "" ||
+		*configmapRulesLocation == "" ||
+		*serviceRulesLocation == "" ||
+		*reloadEndpoint == "" {
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
