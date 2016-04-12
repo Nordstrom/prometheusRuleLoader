@@ -8,6 +8,13 @@ Parameters
 *  -map - Path where the configmap is mounted
 *  -endpoint - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
 
+All of these parameters will by default use the following envriomental variables:
+
+* cmrules defaults to 'CM_RULES_LOCATION'
+* svrules defaults to 'SV_RULES_LOCATION'
+* map defaults to 'CONFIG_MAP_LOCATION'
+* endpoint defaults to 'PROMETHEUS_RELOAD_ENDPOINT'
+
 for example:
 ./PrometheusRuleLoader -cmrules ./cmrules.rules -svrules ./svrules.rules -map ./config -endpoint http://prometheus.cluster.local/-/reload
 
