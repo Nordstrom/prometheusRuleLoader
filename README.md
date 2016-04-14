@@ -1,4 +1,4 @@
-This tool watches a volume mounted configmap directory and kubernetes events for services with annotations labeled "nordstrom.net/alerts" for Prometheus alerting rules. If they are found they are validated and placed into two files (one for annotations and one for configmaps) then the passed enpoint is hit.
+This tool watches a volume mounted configmap directory and kubernetes events for services with annotations labeled "nordstrom.net/alerts/prometheus" for Prometheus alerting rules. If they are found they are validated and placed into two files (one for annotations and one for configmaps) then the passed enpoint is hit.
 
 Parameters
 ==========
@@ -20,7 +20,11 @@ for example:
 
 Service Annotations
 ===================
-The annotation supports either a json string or a json array. Examples:
+The annotation supports either a json string or a json array. The annotation must have the key "nordstrom.net/alerts/prometheus"
+
+Examples:
+
+
 
 	---
 	apiVersion: v1
@@ -31,7 +35,7 @@ The annotation supports either a json string or a json array. Examples:
 	  labels:
 	    app: fake
 	  annotations: {
-	    "nordstrom.net/alerts" : "\"ALERT DiskFilling
+	    "nordstrom.net/alerts/prometheus" : "\"ALERT DiskFilling
 	    IF (container_fs_usage_bytes{id='/'} / container_fs_limit_bytes{id='/'})*100 > 80.0
 	    FOR 5m
 	    LABELS { severity = 'critical' }
@@ -58,7 +62,7 @@ OR
 	  labels:
 	    app: fake
 	  annotations: {
-	    "nordstrom.net/alerts" : "[\"ALERT DiskFilling
+	    "nordstrom.net/alerts/prometheus" : "[\"ALERT DiskFilling
 	    IF (container_fs_usage_bytes{id='/'} / container_fs_limit_bytes{id='/'})*100 > 80.0
 	    FOR 5m
 	    LABELS { severity = 'critical' }

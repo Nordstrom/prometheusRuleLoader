@@ -272,7 +272,7 @@ func GatherRulesFromServices(kubeClient *kclient.Client) []string {
 
 		for k, v := range anno {
 			log.Printf("- %s", k)
-			if k == "nordstrom.net/alerts" {
+			if k == "nordstrom.net/alerts/prometheus" {
 				var alerts interface{}
 				err := json.Unmarshal([]byte(v), &alerts)
 				if err != nil {
