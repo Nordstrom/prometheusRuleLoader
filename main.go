@@ -73,6 +73,7 @@ func main() {
 	// load base config
 	updateConfigMapRules(*mapLocation, *configmapRulesLocation)
 	updateServiceRules(kubeClient, *serviceRulesLocation)
+	reloadRules(*reloadEndpoint)
 
 	// setup file watcher, will trigger whenever the configmap updates
 	watcher, err := WatchFile(*mapLocation, time.Second, func() {
@@ -272,7 +273,7 @@ func GatherRulesFromServices(kubeClient *kclient.Client) []string {
 
 		for k, v := range anno {
 			log.Printf("- %s", k)
-			if k == "nordstrom.net/alerts/prometheus" {
+			if k == "nordstrom.net/prometheusAlerts" {
 				var alerts interface{}
 				err := json.Unmarshal([]byte(v), &alerts)
 				if err != nil {
