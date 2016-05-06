@@ -35,6 +35,8 @@ var (
 	helpFlag = flag.Bool("help", false, "")
 
 	lastSvcSha = ""
+
+	testRule = "[ \"ALERT helloworldHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'hello-world is down.' }\", \"ALERT itemqueryserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'item-query-service is down.' }\", \"ALERT pointofserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'point-of-service is down.' }\" ]"
 )
 
 const (
@@ -210,7 +212,7 @@ func processRuleString(rule string, metadata string) (string, error) {
 
 	err := CheckRules(rule)
 	if err != nil {
-		return "", fmt.Errorf("Rule rejected: %s. Reason: %s\n", metadata, err)
+		return "", fmt.Errorf("Rule rejected: %s. Reason: %s\n, Rule: %s", metadata, err, rule)
 	}
 	log.Printf("Rule passed!\n")
 
