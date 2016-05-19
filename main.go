@@ -1,9 +1,8 @@
-package main
+package main //import "github.com/nordstrom/prometheusRuleLoader"
 
 import (
 	"bufio"
 	"crypto/sha1"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -11,9 +10,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v2"
 	//"gopkg.in/yaml.v2"
 
 	kapi "k8s.io/kubernetes/pkg/api"
@@ -32,11 +32,10 @@ var (
 	serviceRulesLocation   = flag.String("svrules", os.Getenv("SV_RULES_LOCATION"), "Filename where the rules from the services should be written.")
 	reloadEndpoint         = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
 
-	helpFlag = flag.Bool("help", false, "")
-
-	lastSvcSha = ""
-
-	testRule = "[ \"ALERT helloworldHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'hello-world is down.' }\", \"ALERT itemqueryserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'item-query-service is down.' }\", \"ALERT pointofserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'point-of-service is down.' }\" ]"
+	helpFlag      = flag.Bool("help", false, "")
+	lastSvcSha    = ""
+	testRule      = "[ \"ALERT helloworldHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'hello-world is down.' }\", \"ALERT itemqueryserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'item-query-service is down.' }\", \"ALERT pointofserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'point-of-service is down.' }\" ]"
+	annotationKey = flag.String("annotationKey", "nordstrom.net/prometheusAlerts", "Annotation key for prometheus rules")
 )
 
 const (
@@ -174,6 +173,56 @@ func updateServiceRules(kubeClient *kclient.Client, rulesLocation string) bool {
 	return false
 }
 
+func GatherFilesFromConfigmap(mapLocation string) []string {
+	fileList := []string{}
+	err := filepath.Walk(mapLocation, func(path string, f os.FileInfo, err error) error {
+		stat, err := os.Stat(path)
+		if err != nil {
+			log.Printf("Cannot stat %s, %s\n", path, err)
+		}
+		if !stat.IsDir() {
+			// ignore the configmap /..dirname directories
+			if !(strings.Contains(path, "/..")) {
+				fileList = append(fileList, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		// not sure what I might see here, so making this fatal for now
+		log.Printf("Cannot process path: %s, %s\n", mapLocation, err)
+	}
+	return fileList
+}
+
+func GatherRulesFromServices(kubeClient *kclient.Client) []string {
+	si := kubeClient.Services(kapi.NamespaceAll)
+	serviceList, err := si.List(kapi.ListOptions{
+		LabelSelector: klabels.Everything(),
+		FieldSelector: kselector.Everything()})
+	if err != nil {
+		log.Printf("Unable to list services: %s", err)
+	}
+
+	ruleList := []string{}
+
+	for _, svc := range serviceList.Items {
+		anno := svc.GetObjectMeta().GetAnnotations()
+		name := svc.GetObjectMeta().GetName()
+		log.Printf("Processing Service - %s\n", name)
+
+		for k, v := range anno {
+			if k == *annotationKey {
+				if err := yaml.Unmarshal([]byte(v), &ruleList); err != nil {
+					log.Printf("Unable to unmarshal elastalert rule for service %s. Error: %s; Rule: %s. Skipping rule.\n", name, err, v)
+				}
+			}
+		}
+	}
+
+	return ruleList
+}
+
 func writeRules(rules string, rulesLocation string) error {
 	f, err := os.Create(rulesLocation)
 	if err != nil {
@@ -233,70 +282,6 @@ func reloadRules(url string) {
 		respBody, _ := ioutil.ReadAll(resp.Body)
 		log.Printf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
 	}
-}
-
-func GatherFilesFromConfigmap(mapLocation string) []string {
-	fileList := []string{}
-	err := filepath.Walk(mapLocation, func(path string, f os.FileInfo, err error) error {
-		stat, err := os.Stat(path)
-		if err != nil {
-			log.Printf("Cannot stat %s, %s\n", path, err)
-		}
-		if !stat.IsDir() {
-			// ignore the configmap /..dirname directories
-			if !(strings.Contains(path, "/..")) {
-				fileList = append(fileList, path)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		// not sure what I might see here, so making this fatal for now
-		log.Printf("Cannot process path: %s, %s\n", mapLocation, err)
-	}
-	return fileList
-}
-
-func GatherRulesFromServices(kubeClient *kclient.Client) []string {
-	si := kubeClient.Services(kapi.NamespaceAll)
-	serviceList, err := si.List(kapi.ListOptions{
-		LabelSelector: klabels.Everything(),
-		FieldSelector: kselector.Everything()})
-	if err != nil {
-		log.Printf("Unable to list services: %s", err)
-	}
-
-	ruleList := []string{}
-
-	for _, svc := range serviceList.Items {
-		anno := svc.GetObjectMeta().GetAnnotations()
-		name := svc.GetObjectMeta().GetName()
-		log.Printf("Processing Service - %s\n", name)
-
-		for k, v := range anno {
-			log.Printf("- %s", k)
-			if k == "nordstrom.net/prometheusAlerts" {
-				var alerts interface{}
-				err := json.Unmarshal([]byte(v), &alerts)
-				if err != nil {
-					log.Printf("Error decoding json object that contains alert(s): %s\n", err)
-				}
-				if reflect.TypeOf(alerts).Kind() == reflect.Slice {
-					collection := reflect.ValueOf(alerts)
-					for i := 0; i < collection.Len(); i++ {
-						ruleList = append(ruleList, collection.Index(i).String())
-					}
-				}
-				if reflect.TypeOf(alerts).Kind() == reflect.String {
-					ruleList = append(ruleList, reflect.ValueOf(alerts).String())
-				}
-
-			}
-
-		}
-
-	}
-	return ruleList
 }
 
 func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {

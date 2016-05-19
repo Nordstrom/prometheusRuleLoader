@@ -1,8 +1,7 @@
 FROM nordstrom/baseimage-ubuntu:16.04
 MAINTAINER Innovation Platform Team "invcldtm@nordstrom.com"
 
-COPY PrometheusRuleLoader /bin/PrometheusRuleLoader
-RUN chmod 755 /bin/PrometheusRuleLoader
+COPY prometheusRuleLoader /bin/prometheusRuleLoader
+RUN chmod 755 /bin/prometheusRuleLoader
 
-
-ENTRYPOINT	["/bin/PrometheusRuleLoader"]
+ENTRYPOINT	["/bin/prometheusRuleLoader"]

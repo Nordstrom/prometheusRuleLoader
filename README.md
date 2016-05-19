@@ -24,61 +24,36 @@ The annotation supports either a json string or a json array. The annotation mus
 
 Examples:
 
-
-
-	---
-	apiVersion: v1
-	kind: Service
-	metadata:
-	  name: fakeservice
-	  namespace: default
-	  labels:
-	    app: fake
-	  annotations: {
-	    "nordstrom.net/alerts/prometheus" : "\"ALERT DiskFilling
-	    IF (container_fs_usage_bytes{id='/'} / container_fs_limit_bytes{id='/'})*100 > 80.0
-	    FOR 5m
-	    LABELS { severity = 'critical' }
-	    ANNOTATIONS {
-	      summary = 'Disk {{ $labels.device }} on host {{ $labels.instance }} filling up.',
-	      description = 'Disk {{ $labels.device }} on host {{ $labels.instance }} ({{ $labels.aws_amazon_com_instance_id }}) is filling up. Disk is {{ $value }} full at the time of alerting.'
-	      }\""
-	  }
-	spec:
-	  ports:
-	    - name: foo
-	      port: 80
-	  selector:
-	    app: foo
-
-OR
-
-	---
-	apiVersion: v1
-	kind: Service
-	metadata:
-	  name: fakeservice
-	  namespace: default
-	  labels:
-	    app: fake
-	  annotations: {
-	    "nordstrom.net/alerts/prometheus" : "[\"ALERT DiskFilling
-	    IF (container_fs_usage_bytes{id='/'} / container_fs_limit_bytes{id='/'})*100 > 80.0
-	    FOR 5m
-	    LABELS { severity = 'critical' }
-	    ANNOTATIONS {
-	      summary = 'Disk {{ $labels.device }} on host {{ $labels.instance }} filling up.',
-	      description = 'Disk {{ $labels.device }} on host {{ $labels.instance }} ({{ $labels.aws_amazon_com_instance_id }}) is filling up. Disk is {{ $value }} full at the time of alerting.'
-	      }\",
-	      \"Another rule!\"
-	      ]"
-	  }
-	spec:
-	  ports:
-	    - name: foo
-	      port: 80
-	  selector:
-	    app: foo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakeservice
+  namespace: default
+  labels:
+    app: fake
+  annotations: 
+    nordstrom.net/prometheusAlerts: |
+      - ALERT TooManyFoosTooFast
+        IF sum(rate(fooCounter[1m])) > 1
+        FOR 1m
+        LABELS { severity = "critical" }
+        ANNOTATIONS {
+          description = "Rate of foo very high ({{ $value }})."
+        }
+      - ALERT TooManyLogsTooFast
+        IF sum(rate(logCounter[1m])) > 1
+        FOR 1m
+        LABELS { severity = "warning" }
+        ANNOTATIONS {
+          description = "Rate of log very high ({{ $value }})."
+        }
+spec:
+  ports:
+    - name: foo
+      port: 80
+  selector:
+    app: foo
 
 Other Notes
 ===========
