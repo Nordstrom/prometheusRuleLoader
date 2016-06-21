@@ -1,5 +1,5 @@
 app_name := prometheusRuleLoader
-DOCKER_IMAGE_NAME ?= nordstrom/prometheusruleloader
+DOCKER_IMAGE_NAME ?= quay.io/nordstrom/prometheusruleloader
 DOCKER_IMAGE_TAG  ?= 1.1
 
 .PHONY: build build_image release_image
