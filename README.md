@@ -3,20 +3,21 @@ This tool watches a volume mounted configmap directory and kubernetes events for
 Parameters
 ==========
 
-*  -cmrules - Takes a filename where you would like the configmap rules to be written
-*  -svrules - Takes a filename where you would like the service annotation rules to be written
-*  -map - Path where the configmap is mounted
-*  -endpoint - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
+*  `-cmrules` - Takes a filename where you would like the configmap rules to be written
+*  `-svrules` - Takes a filename where you would like the service annotation rules to be written
+*  `-map` - Path where the configmap is mounted
+*  `-endpoint` - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
 
 All of these parameters will by default use the following envriomental variables:
 
-* cmrules defaults to 'CM_RULES_LOCATION'
-* svrules defaults to 'SV_RULES_LOCATION'
-* map defaults to 'CONFIG_MAP_LOCATION'
-* endpoint defaults to 'PROMETHEUS_RELOAD_ENDPOINT'
+* cmrules defaults to '`CM_RULES_LOCATION`'
+* svrules defaults to '`SV_RULES_LOCATION`'
+* map defaults to '`CONFIG_MAP_LOCATION`'
+* endpoint defaults to '`PROMETHEUS_RELOAD_ENDPOINT`'
 
 for example:
-./PrometheusRuleLoader -cmrules ./cmrules.rules -svrules ./svrules.rules -map ./config -endpoint http://prometheus.cluster.local/-/reload
+
+    ./PrometheusRuleLoader -cmrules ./cmrules.rules -svrules ./svrules.rules -map ./config -endpoint http://prometheus.cluster.local/-/reload
 
 Service Annotations
 ===================
@@ -24,6 +25,7 @@ The annotation supports either a json string or a json array. The annotation mus
 
 Examples:
 
+```yaml
 ---
 apiVersion: v1
 kind: Service
@@ -54,6 +56,7 @@ spec:
       port: 80
   selector:
     app: foo
+```
 
 Other Notes
 ===========
