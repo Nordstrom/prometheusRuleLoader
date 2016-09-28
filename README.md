@@ -3,13 +3,12 @@ Handy Kubernetes sidecar for prometheus. It watches for configmaps in all namesp
 Parameters
 ==========
 
-*  -annotation - Used to customize the annotation label you'd like the rule loader to look like on your configmaps.
-*  -rulespath - The location you would like your rules to be written to. Should correspond to a rule_files path in your prometheus config.
+*  `-annotation` - Used to customize the annotation label you'd like the rule loader to look like on your configmaps.
+*  `-rulespath` - The location you would like your rules to be written to. Should correspond to a rule_files path in your prometheus config.
 *  `-endpoint` - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
 
 All of these parameters will by default use the following envriomental variables:
 
-* cmrules defaults to '`CM_RULES_LOCATION`'
 * annotation defaults to 'CONFIG_MAP_ANNOTATION'
 * rulespath defaults to 'RULES_LOCATION'
 * endpoint defaults to 'PROMETHEUS_RELOAD_ENDPOINT'
@@ -20,7 +19,7 @@ for example:
 
 Configmap Annotation
 ====================
-Assuming a lauch with the above commandline here is an example of a configmap.
+Assuming a launch with the above commandline here is an example of a configmap.
 
 ```yaml
 kind: ConfigMap
