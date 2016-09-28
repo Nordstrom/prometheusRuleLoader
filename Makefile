@@ -1,6 +1,6 @@
 app_name := prometheusRuleLoader
 DOCKER_IMAGE_NAME ?= quay.io/nordstrom/prometheusruleloader
-DOCKER_IMAGE_TAG  ?= 1.1
+DOCKER_IMAGE_TAG  ?= 2.0
 
 .PHONY: build build_image release_image
 
@@ -8,7 +8,7 @@ build: *.go
 	docker run --rm \
 	  -e CGO_ENABLED=true \
 	  -e OUTPUT=$(app_name) \
-	  -v $(shell pwd):/src \
+	  -v $(shell pwd):/src:rw \
 	  centurylink/golang-builder
 
 build_image: Dockerfile

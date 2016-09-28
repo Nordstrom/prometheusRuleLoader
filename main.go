@@ -9,11 +9,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
-	"gopkg.in/yaml.v2"
 	//"gopkg.in/yaml.v2"
 
 	kapi "k8s.io/kubernetes/pkg/api"
@@ -27,10 +24,9 @@ import (
 
 var (
 	// FLAGS
-	mapLocation            = flag.String("map", os.Getenv("CONFIG_MAP_LOCATION"), "Location of the config map mount.")
-	configmapRulesLocation = flag.String("cmrules", os.Getenv("CM_RULES_LOCATION"), "Filename where the rules from the configmap file should be written.")
-	serviceRulesLocation   = flag.String("svrules", os.Getenv("SV_RULES_LOCATION"), "Filename where the rules from the services should be written.")
-	reloadEndpoint         = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
+	configmapAnnotation = flag.String("annotation", os.Getenv("CONFIG_MAP_ANNOTATION"), "Annotation that states that this configmap contains prometheus rules.")
+	rulesLocation       = flag.String("rulespath", os.Getenv("RULES_LOCATION"), "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
+	reloadEndpoint      = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
 
 	helpFlag      = flag.Bool("help", false, "")
 	lastSvcSha    = ""
@@ -51,18 +47,16 @@ func main() {
 	flag.Parse()
 
 	if *helpFlag ||
-		*mapLocation == "" ||
-		*configmapRulesLocation == "" ||
-		*serviceRulesLocation == "" ||
+		*configmapAnnotation == "" ||
+		*rulesLocation == "" ||
 		*reloadEndpoint == "" {
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
 	log.Printf("Rule Updater loaded.\n")
-	log.Printf("ConfigMap location: %s\n", *mapLocation)
-	log.Printf("ConfigMap Rules location: %s\n", *configmapRulesLocation)
-	log.Printf("Service Rules location: %s\n", *serviceRulesLocation)
+	log.Printf("ConfigMap annotation: %s\n", *configmapAnnotation)
+	log.Printf("Rules location: %s\n", *rulesLocation)
 
 	// create client
 	var kubeClient *kclient.Client
@@ -72,24 +66,15 @@ func main() {
 	}
 
 	// load base config
-	updateConfigMapRules(*mapLocation, *configmapRulesLocation)
-	updateServiceRules(kubeClient, *serviceRulesLocation)
+	updateRules(kubeClient, *rulesLocation)
 	reloadRules(*reloadEndpoint)
 
 	// setup file watcher, will trigger whenever the configmap updates
-	watcher, err := WatchFile(*mapLocation, time.Second, func() {
-		log.Printf("ConfigMap files updated.\n")
-		updateConfigMapRules(*mapLocation, *configmapRulesLocation)
-		reloadRules(*reloadEndpoint)
-	})
-	if err != nil {
-		log.Fatalf("Unable to watch ConfigMap: %s\n", err)
-	}
 
-	// setup watcher for services
-	_ = watchForServices(kubeClient, func(interface{}) {
-		log.Printf("Services have updated.\n")
-		check := updateServiceRules(kubeClient, *serviceRulesLocation)
+	// setup watcher for configmaps coming and going
+	_ = watchForConfigmaps(kubeClient, func(interface{}) {
+		log.Printf("Configmaps have updated.\n")
+		check := updateRules(kubeClient, *rulesLocation)
 		if check {
 			reloadRules(*reloadEndpoint)
 		}
@@ -97,55 +82,19 @@ func main() {
 
 	defer func() {
 		log.Printf("Cleaning up.")
-		watcher.Close()
 	}()
 
 	select {}
 }
 
-func loadConfig(configFile string) string {
-	configData, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		log.Fatalf("Cannot read ConfigMap file: %s\n", err)
-	}
+func updateRules(kubeClient *kclient.Client, rulesLocation string) bool {
+	log.Println("Processing rules.")
 
-	return string(configData)
-}
-
-func updateConfigMapRules(mapLocation string, rulesLocation string) {
-	log.Println("Processing ConfigMap rules.")
-	fileList := GatherFilesFromConfigmap(mapLocation)
-
-	var rulesToWrite string
-
-	for _, file := range fileList {
-		content, err := processRuleFile(file)
-		if err != nil {
-			log.Printf("%s", err)
-		} else {
-			rulesToWrite += fmt.Sprintf("%s\n", content)
-		}
-	}
-
-	err := CheckRules(rulesToWrite)
-	if err != nil {
-		log.Printf("Generated ConfigMap rules do not pass: %s.\n%s\n", err, rulesToWrite)
-	}
-
-	err = writeRules(rulesToWrite, rulesLocation)
-	if err != nil {
-		log.Printf("%s\n", err)
-	}
-}
-
-func updateServiceRules(kubeClient *kclient.Client, rulesLocation string) bool {
-	log.Println("Processing Service rules.")
-
-	ruleList := GatherRulesFromServices(kubeClient)
+	ruleList := GatherRulesFromConfigmaps(kubeClient)
 
 	var rulesToWrite string
 	for _, rule := range ruleList {
-		content, err := processRuleString(rule, "Service")
+		content, err := processRuleString(rule)
 		if err != nil {
 			log.Printf("%s", err)
 		} else {
@@ -155,7 +104,7 @@ func updateServiceRules(kubeClient *kclient.Client, rulesLocation string) bool {
 
 	err := CheckRules(rulesToWrite)
 	if err != nil {
-		log.Printf("Generated Service rules do not pass: %s.\n%s\n", err, rulesToWrite)
+		log.Printf("Generated rule does not pass: %s.\n%s\n", err, rulesToWrite)
 	}
 
 	// only write and
@@ -173,51 +122,31 @@ func updateServiceRules(kubeClient *kclient.Client, rulesLocation string) bool {
 	return false
 }
 
-func GatherFilesFromConfigmap(mapLocation string) []string {
-	fileList := []string{}
-	err := filepath.Walk(mapLocation, func(path string, f os.FileInfo, err error) error {
-		stat, err := os.Stat(path)
-		if err != nil {
-			log.Printf("Cannot stat %s, %s\n", path, err)
-		}
-		if !stat.IsDir() {
-			// ignore the configmap /..dirname directories
-			if !(strings.Contains(path, "/..")) {
-				fileList = append(fileList, path)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		// not sure what I might see here, so making this fatal for now
-		log.Printf("Cannot process path: %s, %s\n", mapLocation, err)
-	}
-	return fileList
-}
-
-func GatherRulesFromServices(kubeClient *kclient.Client) []string {
-	si := kubeClient.Services(kapi.NamespaceAll)
-	serviceList, err := si.List(kapi.ListOptions{
+func GatherRulesFromConfigmaps(kubeClient *kclient.Client) []string {
+	si := kubeClient.ConfigMaps(kapi.NamespaceAll)
+	mapList, err := si.List(kapi.ListOptions{
 		LabelSelector: klabels.Everything(),
 		FieldSelector: kselector.Everything()})
 	if err != nil {
-		log.Printf("Unable to list services: %s", err)
+		log.Printf("Unable to list configmaps: %s", err)
 	}
 
 	ruleList := []string{}
 
-	for _, svc := range serviceList.Items {
-		anno := svc.GetObjectMeta().GetAnnotations()
-		name := svc.GetObjectMeta().GetName()
-		log.Printf("Processing Service - %s\n", name)
+	for _, cm := range mapList.Items {
+		anno := cm.GetObjectMeta().GetAnnotations()
+		name := cm.GetObjectMeta().GetName()
 
-		for k, v := range anno {
-			if k == *annotationKey {
-				if err := yaml.Unmarshal([]byte(v), &ruleList); err != nil {
-					log.Printf("Unable to unmarshal elastalert rule for service %s. Error: %s; Rule: %s. Skipping rule.\n", name, err, v)
+		for k, _ := range anno {
+			if k == *configmapAnnotation {
+				log.Printf("Annotation found, processing Configmap - %s\n", name)
+				for cmk, cmv := range cm.Data {
+					log.Printf("Found potential rule - %s\n", cmk)
+					ruleList = append(ruleList, cmv)
 				}
 			}
 		}
+
 	}
 
 	return ruleList
@@ -241,27 +170,10 @@ func writeRules(rules string, rulesLocation string) error {
 	return nil
 }
 
-func processRuleFile(file string) (string, error) {
-	configManager := NewMutexConfigManager(loadConfig(file))
-	defer func() {
-		configManager.Close()
-	}()
-
-	rule := configManager.Get()
-	_, err := processRuleString(rule, fmt.Sprintf("Configmap rule: %s", file))
-	if err != nil {
-		return "", err
-	}
-
-	return rule, nil
-}
-
-func processRuleString(rule string, metadata string) (string, error) {
-	log.Printf("Processing rule: %s", metadata)
-
+func processRuleString(rule string) (string, error) {
 	err := CheckRules(rule)
 	if err != nil {
-		return "", fmt.Errorf("Rule rejected: %s. Reason: %s\n, Rule: %s", metadata, err, rule)
+		return "", fmt.Errorf("Rule rejected, Error: %s\n, Rule: %s", err, rule)
 	}
 	log.Printf("Rule passed!\n")
 
@@ -284,14 +196,14 @@ func reloadRules(url string) {
 	}
 }
 
-func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
-	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kselector.Everything())
+func createConfigmapLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "configmaps", kapi.NamespaceAll, kselector.Everything())
 }
 
-func watchForServices(kubeClient *kclient.Client, callback func(interface{})) kcache.Store {
-	serviceStore, serviceController := kframework.NewInformer(
-		createServiceLW(kubeClient),
-		&kapi.Service{},
+func watchForConfigmaps(kubeClient *kclient.Client, callback func(interface{})) kcache.Store {
+	configmapStore, configmapController := kframework.NewInformer(
+		createConfigmapLW(kubeClient),
+		&kapi.ConfigMap{},
 		0,
 		kframework.ResourceEventHandlerFuncs{
 			AddFunc:    callback,
@@ -299,8 +211,8 @@ func watchForServices(kubeClient *kclient.Client, callback func(interface{})) kc
 			UpdateFunc: func(a interface{}, b interface{}) { callback(b) },
 		},
 	)
-	go serviceController.Run(wait.NeverStop)
-	return serviceStore
+	go configmapController.Run(wait.NeverStop)
+	return configmapStore
 }
 
 func computeSha1(payload string) string {
