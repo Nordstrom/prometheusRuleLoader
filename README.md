@@ -1,3 +1,7 @@
+Changes
+=======
+* New 2.0 version, breaking changes! Moved rules from service annotations to configmaps (we just think it's way cleaner now)
+
 Handy Kubernetes sidecar for prometheus. It watches for configmaps in all namespaces that have the annotation specified with the -annotation flag. When it finds one it pulls each value out and assumes it's a prometheus rule. It then validates them and adds them to a the rules file specified with -rulespath. If that file changes it hits the reload endpoint specified by the -endpoint flag. 
 
 Parameters
