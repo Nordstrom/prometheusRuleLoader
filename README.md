@@ -57,6 +57,10 @@ data:
 
 ```
 
+Deployment
+==========
+PrometheusRuleLoaders docker container should be deployed int he same pod as prometheus. They should both share a volume mount (and emptydir works fine here). PrometheusRuleLoader will use this shared space to write it's rule file to, meanwhile Prometheus should be configured to look for it's rule file at this path.
+
 Other Notes
 ===========
 Every rule is verified and only ones that pass are added to the configuration files. If you see a rule failing to pass you can use the promtool that ships with prometheus to verify it.
