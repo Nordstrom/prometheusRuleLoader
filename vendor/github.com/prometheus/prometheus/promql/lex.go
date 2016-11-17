@@ -48,13 +48,19 @@ func (i item) String() string {
 	return fmt.Sprintf("%q", i.val)
 }
 
-// isOperator returns true if the item corresponds to a logical or arithmetic operator.
+// isOperator returns true if the item corresponds to a arithmetic or set operator.
 // Returns false otherwise.
 func (i itemType) isOperator() bool { return i > operatorsStart && i < operatorsEnd }
 
 // isAggregator returns true if the item belongs to the aggregator functions.
 // Returns false otherwise
 func (i itemType) isAggregator() bool { return i > aggregatorsStart && i < aggregatorsEnd }
+
+// isAggregator returns true if the item is an aggregator that takes a parameter.
+// Returns false otherwise
+func (i itemType) isAggregatorWithParam() bool {
+	return i == itemTopK || i == itemBottomK || i == itemCountValues || i == itemQuantile
+}
 
 // isKeyword returns true if the item corresponds to a keyword.
 // Returns false otherwise.
@@ -71,8 +77,16 @@ func (i itemType) isComparisonOperator() bool {
 	}
 }
 
-// Constants for operator precedence in expressions.
-//
+// isSetOperator returns whether the item corresponds to a set operator.
+func (i itemType) isSetOperator() bool {
+	switch i {
+	case itemLAND, itemLOR, itemLUnless:
+		return true
+	}
+	return false
+}
+
+// LowestPrec is a constant for operator precedence in expressions.
 const LowestPrec = 0 // Non-operators.
 
 // Precedence returns the operator precedence of the binary
@@ -82,7 +96,7 @@ func (i itemType) precedence() int {
 	switch i {
 	case itemLOR:
 		return 1
-	case itemLAND:
+	case itemLAND, itemLUnless:
 		return 2
 	case itemEQL, itemNEQ, itemLTE, itemLSS, itemGTE, itemGTR:
 		return 3
@@ -90,9 +104,21 @@ func (i itemType) precedence() int {
 		return 4
 	case itemMUL, itemDIV, itemMOD:
 		return 5
+	case itemPOW:
+		return 6
 	default:
 		return LowestPrec
 	}
+}
+
+func (i itemType) isRightAssociative() bool {
+	switch i {
+	case itemPOW:
+		return true
+	default:
+		return false
+	}
+
 }
 
 type itemType int
@@ -127,6 +153,7 @@ const (
 	itemDIV
 	itemLAND
 	itemLOR
+	itemLUnless
 	itemEQL
 	itemNEQ
 	itemLTE
@@ -135,6 +162,7 @@ const (
 	itemGTR
 	itemEQLRegex
 	itemNEQRegex
+	itemPOW
 	operatorsEnd
 
 	aggregatorsStart
@@ -146,6 +174,10 @@ const (
 	itemMax
 	itemStddev
 	itemStdvar
+	itemTopK
+	itemBottomK
+	itemCountValues
+	itemQuantile
 	aggregatorsEnd
 
 	keywordsStart
@@ -160,52 +192,47 @@ const (
 	itemBy
 	itemWithout
 	itemOn
+	itemIgnoring
 	itemGroupLeft
 	itemGroupRight
 	itemBool
-	// Old alerting syntax
-	itemWith
-	itemSummary
-	itemRunbook
-	itemDescription
 	keywordsEnd
 )
 
 var key = map[string]itemType{
 	// Operators.
-	"and": itemLAND,
-	"or":  itemLOR,
+	"and":    itemLAND,
+	"or":     itemLOR,
+	"unless": itemLUnless,
 
 	// Aggregators.
-	"sum":    itemSum,
-	"avg":    itemAvg,
-	"count":  itemCount,
-	"min":    itemMin,
-	"max":    itemMax,
-	"stddev": itemStddev,
-	"stdvar": itemStdvar,
+	"sum":          itemSum,
+	"avg":          itemAvg,
+	"count":        itemCount,
+	"min":          itemMin,
+	"max":          itemMax,
+	"stddev":       itemStddev,
+	"stdvar":       itemStdvar,
+	"topk":         itemTopK,
+	"bottomk":      itemBottomK,
+	"count_values": itemCountValues,
+	"quantile":     itemQuantile,
 
 	// Keywords.
-	"alert":         itemAlert,
-	"if":            itemIf,
-	"for":           itemFor,
-	"labels":        itemLabels,
-	"annotations":   itemAnnotations,
-	"offset":        itemOffset,
-	"by":            itemBy,
-	"without":       itemWithout,
-	"keeping_extra": itemKeepCommon,
-	"keep_common":   itemKeepCommon,
-	"on":            itemOn,
-	"group_left":    itemGroupLeft,
-	"group_right":   itemGroupRight,
-	"bool":          itemBool,
-
-	// Old alerting syntax.
-	"with":        itemWith,
-	"summary":     itemSummary,
-	"runbook":     itemRunbook,
-	"description": itemDescription,
+	"alert":       itemAlert,
+	"if":          itemIf,
+	"for":         itemFor,
+	"labels":      itemLabels,
+	"annotations": itemAnnotations,
+	"offset":      itemOffset,
+	"by":          itemBy,
+	"without":     itemWithout,
+	"keep_common": itemKeepCommon,
+	"on":          itemOn,
+	"ignoring":    itemIgnoring,
+	"group_left":  itemGroupLeft,
+	"group_right": itemGroupRight,
+	"bool":        itemBool,
 }
 
 // These are the default string representations for common items. It does not
@@ -236,6 +263,7 @@ var itemTypeStr = map[itemType]string{
 	itemGTR:      ">",
 	itemEQLRegex: "=~",
 	itemNEQRegex: "!~",
+	itemPOW:      "^",
 }
 
 func init() {
@@ -352,7 +380,7 @@ func (l *lexer) ignore() {
 
 // accept consumes the next rune if it's from the valid set.
 func (l *lexer) accept(valid string) bool {
-	if strings.IndexRune(valid, l.next()) >= 0 {
+	if strings.ContainsRune(valid, l.next()) {
 		return true
 	}
 	l.backup()
@@ -361,7 +389,7 @@ func (l *lexer) accept(valid string) bool {
 
 // acceptRun consumes a run of runes from the valid set.
 func (l *lexer) acceptRun(valid string) {
-	for strings.IndexRune(valid, l.next()) >= 0 {
+	for strings.ContainsRune(valid, l.next()) {
 		// consume
 	}
 	l.backup()
@@ -451,6 +479,8 @@ func lexStatements(l *lexer) stateFn {
 		l.emit(itemADD)
 	case r == '-':
 		l.emit(itemSUB)
+	case r == '^':
+		l.emit(itemPOW)
 	case r == '=':
 		if t := l.peek(); t == '=' {
 			l.next()
@@ -858,4 +888,17 @@ func isDigit(r rune) bool {
 // isAlpha reports whether r is an alphabetic or underscore.
 func isAlpha(r rune) bool {
 	return r == '_' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z')
+}
+
+// isLabel reports whether the string can be used as label.
+func isLabel(s string) bool {
+	if len(s) == 0 || !isAlpha(rune(s[0])) {
+		return false
+	}
+	for _, c := range s[1:] {
+		if !isAlphaNumeric(c) {
+			return false
+		}
+	}
+	return true
 }

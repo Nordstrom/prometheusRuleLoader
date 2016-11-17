@@ -48,7 +48,7 @@ func (e *ParseErr) Error() string {
 	return fmt.Sprintf("parse error at line %d, char %d: %s", e.Line, e.Pos, e.Err)
 }
 
-// ParseStmts parses the input and returns the resulting statements or any occuring error.
+// ParseStmts parses the input and returns the resulting statements or any occurring error.
 func ParseStmts(input string) (Statements, error) {
 	p := newParser(input)
 
@@ -384,57 +384,17 @@ func (p *parser) alertStmt() *AlertStmt {
 		}
 	}
 
-	// Accepting WITH instead of LABELS is temporary compatibility
-	// with the old alerting syntax.
 	var (
-		hasLabels   bool
-		oldSyntax   bool
 		labels      = model.LabelSet{}
 		annotations = model.LabelSet{}
 	)
-	if t := p.peek().typ; t == itemLabels {
+	if p.peek().typ == itemLabels {
 		p.expect(itemLabels, ctx)
 		labels = p.labelSet()
-		hasLabels = true
-	} else if t == itemWith {
-		p.expect(itemWith, ctx)
-		labels = p.labelSet()
-		oldSyntax = true
 	}
-
-	// Only allow old annotation syntax if new label syntax isn't used.
-	if !hasLabels {
-	Loop:
-		for {
-			switch p.next().typ {
-			case itemSummary:
-				annotations["summary"] = model.LabelValue(p.unquoteString(p.expect(itemString, ctx).val))
-
-			case itemDescription:
-				annotations["description"] = model.LabelValue(p.unquoteString(p.expect(itemString, ctx).val))
-
-			case itemRunbook:
-				annotations["runbook"] = model.LabelValue(p.unquoteString(p.expect(itemString, ctx).val))
-
-			default:
-				p.backup()
-				break Loop
-			}
-		}
-		if len(annotations) > 0 {
-			oldSyntax = true
-		}
-	}
-
-	// Only allow new annotation syntax if WITH or old annotation
-	// syntax weren't used.
-	if !oldSyntax {
-		if p.peek().typ == itemAnnotations {
-			p.expect(itemAnnotations, ctx)
-			annotations = p.labelSet()
-		}
-	} else {
-		log.Warnf("Alerting rule with old syntax found. Support for this syntax will be removed with 0.18. Please update to the new syntax.")
+	if p.peek().typ == itemAnnotations {
+		p.expect(itemAnnotations, ctx)
+		annotations = p.labelSet()
 	}
 
 	return &AlertStmt{
@@ -487,7 +447,7 @@ func (p *parser) expr() Expr {
 		vecMatching := &VectorMatching{
 			Card: CardOneToOne,
 		}
-		if op == itemLAND || op == itemLOR {
+		if op.isSetOperator() {
 			vecMatching.Card = CardManyToMany
 		}
 
@@ -501,27 +461,32 @@ func (p *parser) expr() Expr {
 			returnBool = true
 		}
 
-		// Parse ON clause.
-		if p.peek().typ == itemOn {
+		// Parse ON/IGNORING clause.
+		if p.peek().typ == itemOn || p.peek().typ == itemIgnoring {
+			if p.peek().typ == itemOn {
+				vecMatching.On = true
+			}
 			p.next()
-			vecMatching.On = p.labels()
+			vecMatching.MatchingLabels = p.labels()
 
 			// Parse grouping.
-			if t := p.peek().typ; t == itemGroupLeft {
+			if t := p.peek().typ; t == itemGroupLeft || t == itemGroupRight {
 				p.next()
-				vecMatching.Card = CardManyToOne
-				vecMatching.Include = p.labels()
-			} else if t == itemGroupRight {
-				p.next()
-				vecMatching.Card = CardOneToMany
-				vecMatching.Include = p.labels()
+				if t == itemGroupLeft {
+					vecMatching.Card = CardManyToOne
+				} else {
+					vecMatching.Card = CardOneToMany
+				}
+				if p.peek().typ == itemLeftParen {
+					vecMatching.Include = p.labels()
+				}
 			}
 		}
 
-		for _, ln := range vecMatching.On {
+		for _, ln := range vecMatching.MatchingLabels {
 			for _, ln2 := range vecMatching.Include {
-				if ln == ln2 {
-					p.errorf("label %q must not occur in ON and INCLUDE clause at once", ln)
+				if ln == ln2 && vecMatching.On {
+					p.errorf("label %q must not occur in ON and GROUP clause at once", ln)
 				}
 			}
 		}
@@ -535,29 +500,31 @@ func (p *parser) expr() Expr {
 }
 
 func (p *parser) balance(lhs Expr, op itemType, rhs Expr, vecMatching *VectorMatching, returnBool bool) *BinaryExpr {
-	if lhsBE, ok := lhs.(*BinaryExpr); ok && lhsBE.Op.precedence() < op.precedence() {
-		balanced := p.balance(lhsBE.RHS, op, rhs, vecMatching, returnBool)
-		if lhsBE.Op.isComparisonOperator() && !lhsBE.ReturnBool && balanced.Type() == model.ValScalar && lhsBE.LHS.Type() == model.ValScalar {
-			p.errorf("comparisons between scalars must use BOOL modifier")
+	if lhsBE, ok := lhs.(*BinaryExpr); ok {
+		precd := lhsBE.Op.precedence() - op.precedence()
+		if (precd < 0) || (precd == 0 && op.isRightAssociative()) {
+			balanced := p.balance(lhsBE.RHS, op, rhs, vecMatching, returnBool)
+			if lhsBE.Op.isComparisonOperator() && !lhsBE.ReturnBool && balanced.Type() == model.ValScalar && lhsBE.LHS.Type() == model.ValScalar {
+				p.errorf("comparisons between scalars must use BOOL modifier")
+			}
+			return &BinaryExpr{
+				Op:             lhsBE.Op,
+				LHS:            lhsBE.LHS,
+				RHS:            balanced,
+				VectorMatching: lhsBE.VectorMatching,
+				ReturnBool:     lhsBE.ReturnBool,
+			}
 		}
-		return &BinaryExpr{
-			Op:             lhsBE.Op,
-			LHS:            lhsBE.LHS,
-			RHS:            balanced,
-			VectorMatching: lhsBE.VectorMatching,
-			ReturnBool:     lhsBE.ReturnBool,
-		}
-	} else {
-		if op.isComparisonOperator() && !returnBool && rhs.Type() == model.ValScalar && lhs.Type() == model.ValScalar {
-			p.errorf("comparisons between scalars must use BOOL modifier")
-		}
-		return &BinaryExpr{
-			Op:             op,
-			LHS:            lhs,
-			RHS:            rhs,
-			VectorMatching: vecMatching,
-			ReturnBool:     returnBool,
-		}
+	}
+	if op.isComparisonOperator() && !returnBool && rhs.Type() == model.ValScalar && lhs.Type() == model.ValScalar {
+		p.errorf("comparisons between scalars must use BOOL modifier")
+	}
+	return &BinaryExpr{
+		Op:             op,
+		LHS:            lhs,
+		RHS:            rhs,
+		VectorMatching: vecMatching,
+		ReturnBool:     returnBool,
 	}
 }
 
@@ -704,14 +671,19 @@ func (p *parser) labels() model.LabelNames {
 	p.expect(itemLeftParen, ctx)
 
 	labels := model.LabelNames{}
-	for {
-		id := p.expect(itemIdentifier, ctx)
-		labels = append(labels, model.LabelName(id.val))
+	if p.peek().typ != itemRightParen {
+		for {
+			id := p.next()
+			if !isLabel(id.val) {
+				p.errorf("unexpected %s in %s, expected label", id.desc(), ctx)
+			}
+			labels = append(labels, model.LabelName(id.val))
 
-		if p.peek().typ != itemComma {
-			break
+			if p.peek().typ != itemComma {
+				break
+			}
+			p.next()
 		}
-		p.next()
 	}
 	p.expect(itemRightParen, ctx)
 
@@ -731,7 +703,7 @@ func (p *parser) aggrExpr() *AggregateExpr {
 		p.errorf("expected aggregation operator but got %s", agop)
 	}
 	var grouping model.LabelNames
-	var keepExtra, without bool
+	var keepCommon, without bool
 
 	modifiersFirst := false
 
@@ -745,11 +717,16 @@ func (p *parser) aggrExpr() *AggregateExpr {
 	}
 	if p.peek().typ == itemKeepCommon {
 		p.next()
-		keepExtra = true
+		keepCommon = true
 		modifiersFirst = true
 	}
 
 	p.expect(itemLeftParen, ctx)
+	var param Expr
+	if agop.typ.isAggregatorWithParam() {
+		param = p.expr()
+		p.expect(itemComma, ctx)
+	}
 	e := p.expr()
 	p.expect(itemRightParen, ctx)
 
@@ -766,20 +743,21 @@ func (p *parser) aggrExpr() *AggregateExpr {
 		}
 		if p.peek().typ == itemKeepCommon {
 			p.next()
-			keepExtra = true
+			keepCommon = true
 		}
 	}
 
-	if keepExtra && without {
+	if keepCommon && without {
 		p.errorf("cannot use 'keep_common' with 'without'")
 	}
 
 	return &AggregateExpr{
-		Op:              agop.typ,
-		Expr:            e,
-		Grouping:        grouping,
-		Without:         without,
-		KeepExtraLabels: keepExtra,
+		Op:               agop.typ,
+		Expr:             e,
+		Param:            param,
+		Grouping:         grouping,
+		Without:          without,
+		KeepCommonLabels: keepCommon,
 	}
 }
 
@@ -965,8 +943,6 @@ func (p *parser) offset() time.Duration {
 //		[<metric_identifier>] <label_matchers>
 //
 func (p *parser) vectorSelector(name string) *VectorSelector {
-	const ctx = "metric selector"
-
 	var matchers metric.LabelMatchers
 	// Parse label matching if any.
 	if t := p.peek(); t.typ == itemLeftBrace {
@@ -980,11 +956,11 @@ func (p *parser) vectorSelector(name string) *VectorSelector {
 			}
 		}
 		// Set name label matching.
-		matchers = append(matchers, &metric.LabelMatcher{
-			Type:  metric.Equal,
-			Name:  model.MetricNameLabel,
-			Value: model.LabelValue(name),
-		})
+		m, err := metric.NewLabelMatcher(metric.Equal, model.MetricNameLabel, model.LabelValue(name))
+		if err != nil {
+			panic(err) // Must not happen with metric.Equal.
+		}
+		matchers = append(matchers, m)
 	}
 
 	if len(matchers) == 0 {
@@ -994,14 +970,7 @@ func (p *parser) vectorSelector(name string) *VectorSelector {
 	// implicit selection of all metrics (e.g. by a typo).
 	notEmpty := false
 	for _, lm := range matchers {
-		// Matching changes the inner state of the regex and causes reflect.DeepEqual
-		// to return false, which break tests.
-		// Thus, we create a new label matcher for this testing.
-		lm, err := metric.NewLabelMatcher(lm.Type, lm.Name, lm.Value)
-		if err != nil {
-			p.error(err)
-		}
-		if !lm.Match("") {
+		if !lm.MatchesEmptyString() {
 			notEmpty = true
 			break
 		}
@@ -1076,37 +1045,43 @@ func (p *parser) checkType(node Node) (typ model.ValueType) {
 			p.errorf("aggregation operator expected in aggregation expression but got %q", n.Op)
 		}
 		p.expectType(n.Expr, model.ValVector, "aggregation expression")
+		if n.Op == itemTopK || n.Op == itemBottomK || n.Op == itemQuantile {
+			p.expectType(n.Param, model.ValScalar, "aggregation parameter")
+		}
+		if n.Op == itemCountValues {
+			p.expectType(n.Param, model.ValString, "aggregation parameter")
+		}
 
 	case *BinaryExpr:
 		lt := p.checkType(n.LHS)
 		rt := p.checkType(n.RHS)
 
 		if !n.Op.isOperator() {
-			p.errorf("only logical and arithmetic operators allowed in binary expression, got %q", n.Op)
+			p.errorf("binary expression does not support operator %q", n.Op)
 		}
 		if (lt != model.ValScalar && lt != model.ValVector) || (rt != model.ValScalar && rt != model.ValVector) {
 			p.errorf("binary expression must contain only scalar and vector types")
 		}
 
 		if (lt != model.ValVector || rt != model.ValVector) && n.VectorMatching != nil {
-			if len(n.VectorMatching.On) > 0 {
+			if len(n.VectorMatching.MatchingLabels) > 0 {
 				p.errorf("vector matching only allowed between vectors")
 			}
 			n.VectorMatching = nil
 		} else {
 			// Both operands are vectors.
-			if n.Op == itemLAND || n.Op == itemLOR {
+			if n.Op.isSetOperator() {
 				if n.VectorMatching.Card == CardOneToMany || n.VectorMatching.Card == CardManyToOne {
-					p.errorf("no grouping allowed for AND and OR operations")
+					p.errorf("no grouping allowed for %q operation", n.Op)
 				}
 				if n.VectorMatching.Card != CardManyToMany {
-					p.errorf("AND and OR operations must always be many-to-many")
+					p.errorf("set operations must always be many-to-many")
 				}
 			}
 		}
 
-		if (lt == model.ValScalar || rt == model.ValScalar) && (n.Op == itemLAND || n.Op == itemLOR) {
-			p.errorf("AND and OR not allowed in binary scalar expression")
+		if (lt == model.ValScalar || rt == model.ValScalar) && n.Op.isSetOperator() {
+			p.errorf("set operator %q not allowed in binary scalar expression", n.Op)
 		}
 
 	case *Call:

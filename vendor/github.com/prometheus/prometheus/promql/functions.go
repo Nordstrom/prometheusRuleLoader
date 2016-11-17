@@ -14,11 +14,11 @@
 package promql
 
 import (
-	"container/heap"
 	"math"
 	"regexp"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/prometheus/common/model"
 
@@ -69,7 +69,7 @@ func extrapolatedRate(ev *evaluator, arg Expr, isCounter bool, isRate bool) mode
 		for _, sample := range samples.Values {
 			currentValue := sample.Value
 			if isCounter && currentValue < lastValue {
-				counterCorrection += lastValue - currentValue
+				counterCorrection += lastValue
 			}
 			lastValue = currentValue
 		}
@@ -146,8 +146,17 @@ func funcIncrease(ev *evaluator, args Expressions) model.Value {
 
 // === irate(node model.ValMatrix) Vector ===
 func funcIrate(ev *evaluator, args Expressions) model.Value {
+	return instantValue(ev, args[0], true)
+}
+
+// === idelta(node model.ValMatric) Vector ===
+func funcIdelta(ev *evaluator, args Expressions) model.Value {
+	return instantValue(ev, args[0], false)
+}
+
+func instantValue(ev *evaluator, arg Expr, isRate bool) model.Value {
 	resultVector := vector{}
-	for _, samples := range ev.evalMatrix(args[0]) {
+	for _, samples := range ev.evalMatrix(arg) {
 		// No sense in trying to compute a rate without at least two points. Drop
 		// this vector element.
 		if len(samples.Values) < 2 {
@@ -158,7 +167,7 @@ func funcIrate(ev *evaluator, args Expressions) model.Value {
 		previousSample := samples.Values[len(samples.Values)-2]
 
 		var resultValue model.SampleValue
-		if lastSample.Value < previousSample.Value {
+		if isRate && lastSample.Value < previousSample.Value {
 			// Counter reset.
 			resultValue = lastSample.Value
 		} else {
@@ -170,8 +179,11 @@ func funcIrate(ev *evaluator, args Expressions) model.Value {
 			// Avoid dividing by 0.
 			continue
 		}
-		// Convert to per-second.
-		resultValue /= model.SampleValue(sampledInterval.Seconds())
+
+		if isRate {
+			// Convert to per-second.
+			resultValue /= model.SampleValue(sampledInterval.Seconds())
+		}
 
 		resultSample := &sample{
 			Metric:    samples.Metric,
@@ -181,6 +193,102 @@ func funcIrate(ev *evaluator, args Expressions) model.Value {
 		resultSample.Metric.Del(model.MetricNameLabel)
 		resultVector = append(resultVector, resultSample)
 	}
+	return resultVector
+}
+
+// Calculate the trend value at the given index i in raw data d.
+// This is somewhat analogous to the slope of the trend at the given index.
+// The argument "s" is the set of computed smoothed values.
+// The argument "b" is the set of computed trend factors.
+// The argument "d" is the set of raw input values.
+func calcTrendValue(i int, sf, tf float64, s, b, d []float64) float64 {
+	if i == 0 {
+		return b[0]
+	}
+
+	x := tf * (s[i] - s[i-1])
+	y := (1 - tf) * b[i-1]
+
+	// Cache the computed value.
+	b[i] = x + y
+
+	return b[i]
+}
+
+// Holt-Winters is similar to a weighted moving average, where historical data has exponentially less influence on the current data.
+// Holt-Winter also accounts for trends in data. The smoothing factor (0 < sf < 1) affects how historical data will affect the current
+// data. A lower smoothing factor increases the influence of historical data. The trend factor (0 < tf < 1) affects
+// how trends in historical data will affect the current data. A higher trend factor increases the influence.
+// of trends. Algorithm taken from https://en.wikipedia.org/wiki/Exponential_smoothing titled: "Double exponential smoothing".
+func funcHoltWinters(ev *evaluator, args Expressions) model.Value {
+	mat := ev.evalMatrix(args[0])
+
+	// The smoothing factor argument.
+	sf := ev.evalFloat(args[1])
+
+	// The trend factor argument.
+	tf := ev.evalFloat(args[2])
+
+	// Sanity check the input.
+	if sf <= 0 || sf >= 1 {
+		ev.errorf("invalid smoothing factor. Expected: 0 < sf < 1 got: %f", sf)
+	}
+	if tf <= 0 || tf >= 1 {
+		ev.errorf("invalid trend factor. Expected: 0 < tf < 1 got: %f", sf)
+	}
+
+	// Make an output vector large enough to hold the entire result.
+	resultVector := make(vector, 0, len(mat))
+
+	// Create scratch values.
+	var s, b, d []float64
+
+	var l int
+	for _, samples := range mat {
+		l = len(samples.Values)
+
+		// Can't do the smoothing operation with less than two points.
+		if l < 2 {
+			continue
+		}
+
+		// Resize scratch values.
+		if l != len(s) {
+			s = make([]float64, l)
+			b = make([]float64, l)
+			d = make([]float64, l)
+		}
+
+		// Fill in the d values with the raw values from the input.
+		for i, v := range samples.Values {
+			d[i] = float64(v.Value)
+		}
+
+		// Set initial values.
+		s[0] = d[0]
+		b[0] = d[1] - d[0]
+
+		// Run the smoothing operation.
+		var x, y float64
+		for i := 1; i < len(d); i++ {
+
+			// Scale the raw value against the smoothing factor.
+			x = sf * d[i]
+
+			// Scale the last smoothed value with the trend at this point.
+			y = (1 - sf) * (s[i-1] + calcTrendValue(i-1, sf, tf, s, b, d))
+
+			s[i] = x + y
+		}
+
+		samples.Metric.Del(model.MetricNameLabel)
+		resultVector = append(resultVector, &sample{
+			Metric:    samples.Metric,
+			Value:     model.SampleValue(s[len(s)-1]), // The last value in the vector is the smoothed result.
+			Timestamp: ev.Timestamp,
+		})
+	}
+
 	return resultVector
 }
 
@@ -200,52 +308,6 @@ func funcSortDesc(ev *evaluator, args Expressions) model.Value {
 	byValueSorter := vectorByValueHeap(ev.evalVector(args[0]))
 	sort.Sort(sort.Reverse(byValueSorter))
 	return vector(byValueSorter)
-}
-
-// === topk(k model.ValScalar, node model.ValVector) Vector ===
-func funcTopk(ev *evaluator, args Expressions) model.Value {
-	k := ev.evalInt(args[0])
-	if k < 1 {
-		return vector{}
-	}
-	vec := ev.evalVector(args[1])
-
-	topk := make(vectorByValueHeap, 0, k)
-
-	for _, el := range vec {
-		if len(topk) < k || topk[0].Value < el.Value || math.IsNaN(float64(topk[0].Value)) {
-			if len(topk) == k {
-				heap.Pop(&topk)
-			}
-			heap.Push(&topk, el)
-		}
-	}
-	// The heap keeps the lowest value on top, so reverse it.
-	sort.Sort(sort.Reverse(topk))
-	return vector(topk)
-}
-
-// === bottomk(k model.ValScalar, node model.ValVector) Vector ===
-func funcBottomk(ev *evaluator, args Expressions) model.Value {
-	k := ev.evalInt(args[0])
-	if k < 1 {
-		return vector{}
-	}
-	vec := ev.evalVector(args[1])
-
-	bottomk := make(vectorByReverseValueHeap, 0, k)
-
-	for _, el := range vec {
-		if len(bottomk) < k || bottomk[0].Value > el.Value || math.IsNaN(float64(bottomk[0].Value)) {
-			if len(bottomk) == k {
-				heap.Pop(&bottomk)
-			}
-			heap.Push(&bottomk, el)
-		}
-	}
-	// The heap keeps the highest value on top, so reverse it.
-	sort.Sort(sort.Reverse(bottomk))
-	return vector(bottomk)
 }
 
 // === clamp_max(vector model.ValVector, max Scalar) Vector ===
@@ -426,6 +488,59 @@ func funcSumOverTime(ev *evaluator, args Expressions) model.Value {
 			sum += v.Value
 		}
 		return sum
+	})
+}
+
+// === quantile_over_time(matrix model.ValMatrix) Vector ===
+func funcQuantileOverTime(ev *evaluator, args Expressions) model.Value {
+	q := ev.evalFloat(args[0])
+	mat := ev.evalMatrix(args[1])
+	resultVector := vector{}
+
+	for _, el := range mat {
+		if len(el.Values) == 0 {
+			continue
+		}
+
+		el.Metric.Del(model.MetricNameLabel)
+		values := make(vectorByValueHeap, 0, len(el.Values))
+		for _, v := range el.Values {
+			values = append(values, &sample{Value: v.Value})
+		}
+		resultVector = append(resultVector, &sample{
+			Metric:    el.Metric,
+			Value:     model.SampleValue(quantile(q, values)),
+			Timestamp: ev.Timestamp,
+		})
+	}
+	return resultVector
+}
+
+// === stddev_over_time(matrix model.ValMatrix) Vector ===
+func funcStddevOverTime(ev *evaluator, args Expressions) model.Value {
+	return aggrOverTime(ev, args, func(values []model.SamplePair) model.SampleValue {
+		var sum, squaredSum, count model.SampleValue
+		for _, v := range values {
+			sum += v.Value
+			squaredSum += v.Value * v.Value
+			count++
+		}
+		avg := sum / count
+		return model.SampleValue(math.Sqrt(float64(squaredSum/count - avg*avg)))
+	})
+}
+
+// === stdvar_over_time(matrix model.ValMatrix) Vector ===
+func funcStdvarOverTime(ev *evaluator, args Expressions) model.Value {
+	return aggrOverTime(ev, args, func(values []model.SamplePair) model.SampleValue {
+		var sum, squaredSum, count model.SampleValue
+		for _, v := range values {
+			sum += v.Value
+			squaredSum += v.Value * v.Value
+			count++
+		}
+		avg := sum / count
+		return squaredSum/count - avg*avg
 	})
 }
 
@@ -628,7 +743,7 @@ func funcHistogramQuantile(ev *evaluator, args Expressions) model.Value {
 	for _, mb := range signatureToMetricWithBuckets {
 		outVec = append(outVec, &sample{
 			Metric:    mb.metric,
-			Value:     model.SampleValue(quantile(q, mb.buckets)),
+			Value:     model.SampleValue(bucketQuantile(q, mb.buckets)),
 			Timestamp: ev.Timestamp,
 		})
 	}
@@ -673,7 +788,7 @@ func funcChanges(ev *evaluator, args Expressions) model.Value {
 		prev := model.SampleValue(samples.Values[0].Value)
 		for _, sample := range samples.Values[1:] {
 			current := sample.Value
-			if current != prev {
+			if current != prev && !(math.IsNaN(float64(current)) && math.IsNaN(float64(prev))) {
 				changes++
 			}
 			prev = current
@@ -745,6 +860,76 @@ func funcVector(ev *evaluator, args Expressions) model.Value {
 	}
 }
 
+// Common code for date related functions.
+func dateWrapper(ev *evaluator, args Expressions, f func(time.Time) model.SampleValue) model.Value {
+	var v vector
+	if len(args) == 0 {
+		v = vector{
+			&sample{
+				Metric: metric.Metric{},
+				Value:  model.SampleValue(ev.Timestamp.Unix()),
+			},
+		}
+	} else {
+		v = ev.evalVector(args[0])
+	}
+	for _, el := range v {
+		el.Metric.Del(model.MetricNameLabel)
+		t := time.Unix(int64(el.Value), 0).UTC()
+		el.Value = f(t)
+	}
+	return v
+}
+
+// === days_in_month(v vector) scalar ===
+func funcDaysInMonth(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(32 - time.Date(t.Year(), t.Month(), 32, 0, 0, 0, 0, time.UTC).Day())
+	})
+}
+
+// === day_of_month(v vector) scalar ===
+func funcDayOfMonth(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Day())
+	})
+}
+
+// === day_of_week(v vector) scalar ===
+func funcDayOfWeek(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Weekday())
+	})
+}
+
+// === hour(v vector) scalar ===
+func funcHour(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Hour())
+	})
+}
+
+// === minute(v vector) scalar ===
+func funcMinute(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Minute())
+	})
+}
+
+// === month(v vector) scalar ===
+func funcMonth(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Month())
+	})
+}
+
+// === year(v vector) scalar ===
+func funcYear(ev *evaluator, args Expressions) model.Value {
+	return dateWrapper(ev, args, func(t time.Time) model.SampleValue {
+		return model.SampleValue(t.Year())
+	})
+}
+
 var functions = map[string]*Function{
 	"abs": {
 		Name:       "abs",
@@ -758,23 +943,11 @@ var functions = map[string]*Function{
 		ReturnType: model.ValVector,
 		Call:       funcAbsent,
 	},
-	"increase": {
-		Name:       "increase",
-		ArgTypes:   []model.ValueType{model.ValMatrix},
-		ReturnType: model.ValVector,
-		Call:       funcIncrease,
-	},
 	"avg_over_time": {
 		Name:       "avg_over_time",
 		ArgTypes:   []model.ValueType{model.ValMatrix},
 		ReturnType: model.ValVector,
 		Call:       funcAvgOverTime,
-	},
-	"bottomk": {
-		Name:       "bottomk",
-		ArgTypes:   []model.ValueType{model.ValScalar, model.ValVector},
-		ReturnType: model.ValVector,
-		Call:       funcBottomk,
 	},
 	"ceil": {
 		Name:       "ceil",
@@ -812,6 +985,27 @@ var functions = map[string]*Function{
 		ReturnType: model.ValScalar,
 		Call:       funcCountScalar,
 	},
+	"days_in_month": {
+		Name:         "days_in_month",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcDaysInMonth,
+	},
+	"day_of_month": {
+		Name:         "day_of_month",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcDayOfMonth,
+	},
+	"day_of_week": {
+		Name:         "day_of_week",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcDayOfWeek,
+	},
 	"delta": {
 		Name:       "delta",
 		ArgTypes:   []model.ValueType{model.ValMatrix},
@@ -847,6 +1041,31 @@ var functions = map[string]*Function{
 		ArgTypes:   []model.ValueType{model.ValScalar, model.ValVector},
 		ReturnType: model.ValVector,
 		Call:       funcHistogramQuantile,
+	},
+	"holt_winters": {
+		Name:       "holt_winters",
+		ArgTypes:   []model.ValueType{model.ValMatrix, model.ValScalar, model.ValScalar},
+		ReturnType: model.ValVector,
+		Call:       funcHoltWinters,
+	},
+	"hour": {
+		Name:         "hour",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcHour,
+	},
+	"idelta": {
+		Name:       "idelta",
+		ArgTypes:   []model.ValueType{model.ValMatrix},
+		ReturnType: model.ValVector,
+		Call:       funcIdelta,
+	},
+	"increase": {
+		Name:       "increase",
+		ArgTypes:   []model.ValueType{model.ValMatrix},
+		ReturnType: model.ValVector,
+		Call:       funcIncrease,
 	},
 	"irate": {
 		Name:       "irate",
@@ -890,11 +1109,31 @@ var functions = map[string]*Function{
 		ReturnType: model.ValVector,
 		Call:       funcMinOverTime,
 	},
+	"minute": {
+		Name:         "minute",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcMinute,
+	},
+	"month": {
+		Name:         "month",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcMonth,
+	},
 	"predict_linear": {
 		Name:       "predict_linear",
 		ArgTypes:   []model.ValueType{model.ValMatrix, model.ValScalar},
 		ReturnType: model.ValVector,
 		Call:       funcPredictLinear,
+	},
+	"quantile_over_time": {
+		Name:       "quantile_over_time",
+		ArgTypes:   []model.ValueType{model.ValScalar, model.ValMatrix},
+		ReturnType: model.ValVector,
+		Call:       funcQuantileOverTime,
 	},
 	"rate": {
 		Name:       "rate",
@@ -939,6 +1178,18 @@ var functions = map[string]*Function{
 		ReturnType: model.ValVector,
 		Call:       funcSqrt,
 	},
+	"stddev_over_time": {
+		Name:       "stddev_over_time",
+		ArgTypes:   []model.ValueType{model.ValMatrix},
+		ReturnType: model.ValVector,
+		Call:       funcStddevOverTime,
+	},
+	"stdvar_over_time": {
+		Name:       "stdvar_over_time",
+		ArgTypes:   []model.ValueType{model.ValMatrix},
+		ReturnType: model.ValVector,
+		Call:       funcStdvarOverTime,
+	},
 	"sum_over_time": {
 		Name:       "sum_over_time",
 		ArgTypes:   []model.ValueType{model.ValMatrix},
@@ -951,17 +1202,18 @@ var functions = map[string]*Function{
 		ReturnType: model.ValScalar,
 		Call:       funcTime,
 	},
-	"topk": {
-		Name:       "topk",
-		ArgTypes:   []model.ValueType{model.ValScalar, model.ValVector},
-		ReturnType: model.ValVector,
-		Call:       funcTopk,
-	},
 	"vector": {
 		Name:       "vector",
 		ArgTypes:   []model.ValueType{model.ValScalar},
 		ReturnType: model.ValVector,
 		Call:       funcVector,
+	},
+	"year": {
+		Name:         "year",
+		ArgTypes:     []model.ValueType{model.ValVector},
+		OptionalArgs: 1,
+		ReturnType:   model.ValVector,
+		Call:         funcYear,
 	},
 }
 

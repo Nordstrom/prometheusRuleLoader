@@ -14,6 +14,7 @@
 package promql
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
 	"runtime"
@@ -149,7 +150,7 @@ func (e ErrQueryCanceled) Error() string { return fmt.Sprintf("query was cancele
 // it is associated with.
 type Query interface {
 	// Exec processes the query and
-	Exec() *Result
+	Exec(ctx context.Context) *Result
 	// Statement returns the parsed statement of the query.
 	Statement() Statement
 	// Stats returns statistics about the lifetime of the query.
@@ -191,8 +192,8 @@ func (q *query) Cancel() {
 }
 
 // Exec implements the Query interface.
-func (q *query) Exec() *Result {
-	res, err := q.ng.exec(q)
+func (q *query) Exec(ctx context.Context) *Result {
+	res, err := q.ng.exec(ctx, q)
 	return &Result{Err: err, Value: res}
 }
 
@@ -215,32 +216,24 @@ func contextDone(ctx context.Context, env string) error {
 }
 
 // Engine handles the lifetime of queries from beginning to end.
-// It is connected to a storage.
+// It is connected to a querier.
 type Engine struct {
-	// The storage on which the engine operates.
-	storage local.Storage
-
-	// The base context for all queries and its cancellation function.
-	baseCtx       context.Context
-	cancelQueries func()
+	// The querier on which the engine operates.
+	querier local.Querier
 	// The gate limiting the maximum number of concurrent and waiting queries.
-	gate *queryGate
-
+	gate    *queryGate
 	options *EngineOptions
 }
 
 // NewEngine returns a new engine.
-func NewEngine(storage local.Storage, o *EngineOptions) *Engine {
+func NewEngine(querier local.Querier, o *EngineOptions) *Engine {
 	if o == nil {
 		o = DefaultEngineOptions
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		storage:       storage,
-		baseCtx:       ctx,
-		cancelQueries: cancel,
-		gate:          newQueryGate(o.MaxConcurrentQueries),
-		options:       o,
+		querier: querier,
+		gate:    newQueryGate(o.MaxConcurrentQueries),
+		options: o,
 	}
 }
 
@@ -254,11 +247,6 @@ type EngineOptions struct {
 var DefaultEngineOptions = &EngineOptions{
 	MaxConcurrentQueries: 20,
 	Timeout:              2 * time.Minute,
-}
-
-// Stop the engine and cancel all running queries.
-func (ng *Engine) Stop() {
-	ng.cancelQueries()
 }
 
 // NewInstantQuery returns an evaluation query for the given expression at the given time.
@@ -308,9 +296,8 @@ func (ng *Engine) newQuery(expr Expr, start, end model.Time, interval time.Durat
 // of an arbitrary function during handling. It is used to test the Engine.
 type testStmt func(context.Context) error
 
-func (testStmt) String() string   { return "test statement" }
-func (testStmt) DotGraph() string { return "test statement" }
-func (testStmt) stmt()            {}
+func (testStmt) String() string { return "test statement" }
+func (testStmt) stmt()          {}
 
 func (ng *Engine) newTestQuery(f func(context.Context) error) Query {
 	qry := &query{
@@ -326,8 +313,8 @@ func (ng *Engine) newTestQuery(f func(context.Context) error) Query {
 //
 // At this point per query only one EvalStmt is evaluated. Alert and record
 // statements are not handled by the Engine.
-func (ng *Engine) exec(q *query) (model.Value, error) {
-	ctx, cancel := context.WithTimeout(q.ng.baseCtx, ng.options.Timeout)
+func (ng *Engine) exec(ctx context.Context, q *query) (model.Value, error) {
+	ctx, cancel := context.WithTimeout(ctx, ng.options.Timeout)
 	q.cancel = cancel
 
 	queueTimer := q.stats.GetTimer(stats.ExecQueueTime).Start()
@@ -364,35 +351,14 @@ func (ng *Engine) exec(q *query) (model.Value, error) {
 
 // execEvalStmt evaluates the expression of an evaluation statement for the given time range.
 func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (model.Value, error) {
-	prepareTimer := query.stats.GetTimer(stats.TotalQueryPreparationTime).Start()
-	analyzeTimer := query.stats.GetTimer(stats.QueryAnalysisTime).Start()
-
-	// Only one execution statement per query is allowed.
-	analyzer := &Analyzer{
-		Storage: ng.storage,
-		Expr:    s.Expr,
-		Start:   s.Start,
-		End:     s.End,
-	}
-	err := analyzer.Analyze(ctx)
-	if err != nil {
-		analyzeTimer.Stop()
-		prepareTimer.Stop()
-		return nil, err
-	}
-	analyzeTimer.Stop()
-
-	preloadTimer := query.stats.GetTimer(stats.PreloadTime).Start()
-	closer, err := analyzer.Prepare(ctx)
-	if err != nil {
-		preloadTimer.Stop()
-		prepareTimer.Stop()
-		return nil, err
-	}
-	defer closer.Close()
-
-	preloadTimer.Stop()
+	prepareTimer := query.stats.GetTimer(stats.QueryPreparationTime).Start()
+	err := ng.populateIterators(ctx, s)
 	prepareTimer.Stop()
+	if err != nil {
+		return nil, err
+	}
+
+	defer ng.closeIterators(s)
 
 	evalTimer := query.stats.GetTimer(stats.InnerEvalTime).Start()
 	// Instant evaluation.
@@ -497,8 +463,63 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (
 	return resMatrix, nil
 }
 
+func (ng *Engine) populateIterators(ctx context.Context, s *EvalStmt) error {
+	var queryErr error
+	Inspect(s.Expr, func(node Node) bool {
+		switch n := node.(type) {
+		case *VectorSelector:
+			if s.Start.Equal(s.End) {
+				n.iterators, queryErr = ng.querier.QueryInstant(
+					ctx,
+					s.Start.Add(-n.Offset),
+					StalenessDelta,
+					n.LabelMatchers...,
+				)
+			} else {
+				n.iterators, queryErr = ng.querier.QueryRange(
+					ctx,
+					s.Start.Add(-n.Offset-StalenessDelta),
+					s.End.Add(-n.Offset),
+					n.LabelMatchers...,
+				)
+			}
+			if queryErr != nil {
+				return false
+			}
+		case *MatrixSelector:
+			n.iterators, queryErr = ng.querier.QueryRange(
+				ctx,
+				s.Start.Add(-n.Offset-n.Range),
+				s.End.Add(-n.Offset),
+				n.LabelMatchers...,
+			)
+			if queryErr != nil {
+				return false
+			}
+		}
+		return true
+	})
+	return queryErr
+}
+
+func (ng *Engine) closeIterators(s *EvalStmt) {
+	Inspect(s.Expr, func(node Node) bool {
+		switch n := node.(type) {
+		case *VectorSelector:
+			for _, it := range n.iterators {
+				it.Close()
+			}
+		case *MatrixSelector:
+			for _, it := range n.iterators {
+				it.Close()
+			}
+		}
+		return true
+	})
+}
+
 // An evaluator evaluates given expressions at a fixed timestamp. It is attached to an
-// engine through which it connects to a storage and reports errors. On timeout or
+// engine through which it connects to a querier and reports errors. On timeout or
 // cancellation of its context it terminates.
 type evaluator struct {
 	ctx context.Context
@@ -610,7 +631,7 @@ func (ev *evaluator) eval(expr Expr) model.Value {
 	switch e := expr.(type) {
 	case *AggregateExpr:
 		vector := ev.evalVector(e.Expr)
-		return ev.aggregation(e.Op, e.Grouping, e.Without, e.KeepExtraLabels, vector)
+		return ev.aggregation(e.Op, e.Grouping, e.Without, e.KeepCommonLabels, e.Param, vector)
 
 	case *BinaryExpr:
 		lhs := ev.evalOneOf(e.LHS, model.ValScalar, model.ValVector)
@@ -629,6 +650,8 @@ func (ev *evaluator) eval(expr Expr) model.Value {
 				return ev.vectorAnd(lhs.(vector), rhs.(vector), e.VectorMatching)
 			case itemLOR:
 				return ev.vectorOr(lhs.(vector), rhs.(vector), e.VectorMatching)
+			case itemLUnless:
+				return ev.vectorUnless(lhs.(vector), rhs.(vector), e.VectorMatching)
 			default:
 				return ev.vectorBinop(e.Op, lhs.(vector), rhs.(vector), e.VectorMatching, e.ReturnBool)
 			}
@@ -678,14 +701,14 @@ func (ev *evaluator) eval(expr Expr) model.Value {
 // vectorSelector evaluates a *VectorSelector expression.
 func (ev *evaluator) vectorSelector(node *VectorSelector) vector {
 	vec := vector{}
-	for fp, it := range node.iterators {
+	for _, it := range node.iterators {
 		refTime := ev.Timestamp.Add(-node.Offset)
 		samplePair := it.ValueAtOrBeforeTime(refTime)
 		if samplePair.Timestamp.Before(refTime.Add(-StalenessDelta)) {
 			continue // Sample outside of staleness policy window.
 		}
 		vec = append(vec, &sample{
-			Metric:    node.metrics[fp],
+			Metric:    it.Metric(),
 			Value:     samplePair.Value,
 			Timestamp: ev.Timestamp,
 		})
@@ -701,7 +724,7 @@ func (ev *evaluator) matrixSelector(node *MatrixSelector) matrix {
 	}
 
 	sampleStreams := make([]*sampleStream, 0, len(node.iterators))
-	for fp, it := range node.iterators {
+	for _, it := range node.iterators {
 		samplePairs := it.RangeValues(interval)
 		if len(samplePairs) == 0 {
 			continue
@@ -714,7 +737,7 @@ func (ev *evaluator) matrixSelector(node *MatrixSelector) matrix {
 		}
 
 		sampleStream := &sampleStream{
-			Metric: node.metrics[fp],
+			Metric: it.Metric(),
 			Values: samplePairs,
 		}
 		sampleStreams = append(sampleStreams, sampleStream)
@@ -724,10 +747,9 @@ func (ev *evaluator) matrixSelector(node *MatrixSelector) matrix {
 
 func (ev *evaluator) vectorAnd(lhs, rhs vector, matching *VectorMatching) vector {
 	if matching.Card != CardManyToMany {
-		panic("logical operations must always be many-to-many matching")
+		panic("set operations must only use many-to-many matching")
 	}
-	// If no matching labels are specified, match by all labels.
-	sigf := signatureFunc(matching.On...)
+	sigf := signatureFunc(matching.On, matching.MatchingLabels...)
 
 	var result vector
 	// The set of signatures for the right-hand side vector.
@@ -748,9 +770,9 @@ func (ev *evaluator) vectorAnd(lhs, rhs vector, matching *VectorMatching) vector
 
 func (ev *evaluator) vectorOr(lhs, rhs vector, matching *VectorMatching) vector {
 	if matching.Card != CardManyToMany {
-		panic("logical operations must always be many-to-many matching")
+		panic("set operations must only use many-to-many matching")
 	}
-	sigf := signatureFunc(matching.On...)
+	sigf := signatureFunc(matching.On, matching.MatchingLabels...)
 
 	var result vector
 	leftSigs := map[uint64]struct{}{}
@@ -768,15 +790,34 @@ func (ev *evaluator) vectorOr(lhs, rhs vector, matching *VectorMatching) vector 
 	return result
 }
 
-// vectorBinop evaluates a binary operation between two vector, excluding AND and OR.
+func (ev *evaluator) vectorUnless(lhs, rhs vector, matching *VectorMatching) vector {
+	if matching.Card != CardManyToMany {
+		panic("set operations must only use many-to-many matching")
+	}
+	sigf := signatureFunc(matching.On, matching.MatchingLabels...)
+
+	rightSigs := map[uint64]struct{}{}
+	for _, rs := range rhs {
+		rightSigs[sigf(rs.Metric)] = struct{}{}
+	}
+
+	var result vector
+	for _, ls := range lhs {
+		if _, ok := rightSigs[sigf(ls.Metric)]; !ok {
+			result = append(result, ls)
+		}
+	}
+	return result
+}
+
+// vectorBinop evaluates a binary operation between two vectors, excluding set operators.
 func (ev *evaluator) vectorBinop(op itemType, lhs, rhs vector, matching *VectorMatching, returnBool bool) vector {
 	if matching.Card == CardManyToMany {
-		panic("many-to-many only allowed for AND and OR")
+		panic("many-to-many only allowed for set operators")
 	}
 	var (
-		result       = vector{}
-		sigf         = signatureFunc(matching.On...)
-		resultLabels = append(matching.On, matching.Include...)
+		result = vector{}
+		sigf   = signatureFunc(matching.On, matching.MatchingLabels...)
 	)
 
 	// The control flow below handles one-to-one or many-to-one matching.
@@ -830,7 +871,7 @@ func (ev *evaluator) vectorBinop(op itemType, lhs, rhs vector, matching *VectorM
 		} else if !keep {
 			continue
 		}
-		metric := resultMetric(ls.Metric, op, resultLabels...)
+		metric := resultMetric(ls.Metric, rs.Metric, op, matching)
 
 		insertedSigs, exists := matchedSigs[sig]
 		if matching.Card == CardOneToOne {
@@ -842,7 +883,7 @@ func (ev *evaluator) vectorBinop(op itemType, lhs, rhs vector, matching *VectorM
 			// In many-to-one matching the grouping labels have to ensure a unique metric
 			// for the result vector. Check whether those labels have already been added for
 			// the same matching labels.
-			insertSig := model.SignatureForLabels(metric.Metric, matching.Include...)
+			insertSig := uint64(metric.Metric.Fingerprint())
 			if !exists {
 				insertedSigs = map[uint64]struct{}{}
 				matchedSigs[sig] = insertedSigs
@@ -862,12 +903,16 @@ func (ev *evaluator) vectorBinop(op itemType, lhs, rhs vector, matching *VectorM
 }
 
 // signatureFunc returns a function that calculates the signature for a metric
-// based on the provided labels.
-func signatureFunc(labels ...model.LabelName) func(m metric.Metric) uint64 {
-	if len(labels) == 0 {
+// ignoring the provided labels. If on, then the given labels are only used instead.
+func signatureFunc(on bool, labels ...model.LabelName) func(m metric.Metric) uint64 {
+	if !on {
 		return func(m metric.Metric) uint64 {
-			m.Del(model.MetricNameLabel)
-			return uint64(m.Metric.Fingerprint())
+			tmp := m.Metric.Clone()
+			for _, l := range labels {
+				delete(tmp, l)
+			}
+			delete(tmp, model.MetricNameLabel)
+			return uint64(tmp.Fingerprint())
 		}
 	}
 	return func(m metric.Metric) uint64 {
@@ -877,19 +922,46 @@ func signatureFunc(labels ...model.LabelName) func(m metric.Metric) uint64 {
 
 // resultMetric returns the metric for the given sample(s) based on the vector
 // binary operation and the matching options.
-func resultMetric(met metric.Metric, op itemType, labels ...model.LabelName) metric.Metric {
-	if len(labels) == 0 {
-		if shouldDropMetricName(op) {
-			met.Del(model.MetricNameLabel)
+func resultMetric(lhs, rhs metric.Metric, op itemType, matching *VectorMatching) metric.Metric {
+	if shouldDropMetricName(op) {
+		lhs.Del(model.MetricNameLabel)
+	}
+	if !matching.On {
+		if matching.Card == CardOneToOne {
+			for _, l := range matching.MatchingLabels {
+				lhs.Del(l)
+			}
 		}
-		return met
+		for _, ln := range matching.Include {
+			// Included labels from the `group_x` modifier are taken from the "one"-side.
+			value := rhs.Metric[ln]
+			if value != "" {
+				lhs.Set(ln, rhs.Metric[ln])
+			} else {
+				lhs.Del(ln)
+			}
+		}
+		return lhs
 	}
 	// As we definitely write, creating a new metric is the easiest solution.
 	m := model.Metric{}
-	for _, ln := range labels {
-		// Included labels from the `group_x` modifier are taken from the "many"-side.
-		if v, ok := met.Metric[ln]; ok {
+	if matching.Card == CardOneToOne {
+		for _, ln := range matching.MatchingLabels {
+			if v, ok := lhs.Metric[ln]; ok {
+				m[ln] = v
+			}
+		}
+	} else {
+		for k, v := range lhs.Metric {
+			m[k] = v
+		}
+	}
+	for _, ln := range matching.Include {
+		// Included labels from the `group_x` modifier are taken from the "one"-side .
+		if v, ok := rhs.Metric[ln]; ok {
 			m[ln] = v
+		} else {
+			delete(m, ln)
 		}
 	}
 	return metric.Metric{Metric: m, Copied: false}
@@ -937,6 +1009,8 @@ func scalarBinop(op itemType, lhs, rhs model.SampleValue) model.SampleValue {
 		return lhs * rhs
 	case itemDIV:
 		return lhs / rhs
+	case itemPOW:
+		return model.SampleValue(math.Pow(float64(lhs), float64(rhs)))
 	case itemMOD:
 		if rhs != 0 {
 			return model.SampleValue(int(lhs) % int(rhs))
@@ -969,6 +1043,8 @@ func vectorElemBinop(op itemType, lhs, rhs model.SampleValue) (model.SampleValue
 		return lhs * rhs, true
 	case itemDIV:
 		return lhs / rhs, true
+	case itemPOW:
+		return model.SampleValue(math.Pow(float64(lhs), float64(rhs))), true
 	case itemMOD:
 		if rhs != 0 {
 			return model.SampleValue(int(lhs) % int(rhs)), true
@@ -1005,35 +1081,62 @@ type groupedAggregation struct {
 	value            model.SampleValue
 	valuesSquaredSum model.SampleValue
 	groupCount       int
+	heap             vectorByValueHeap
+	reverseHeap      vectorByReverseValueHeap
 }
 
 // aggregation evaluates an aggregation operation on a vector.
-func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without bool, keepExtra bool, vec vector) vector {
+func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without bool, keepCommon bool, param Expr, vec vector) vector {
 
 	result := map[uint64]*groupedAggregation{}
+	var k int
+	if op == itemTopK || op == itemBottomK {
+		k = ev.evalInt(param)
+		if k < 1 {
+			return vector{}
+		}
+	}
+	var q float64
+	if op == itemQuantile {
+		q = ev.evalFloat(param)
+	}
+	var valueLabel model.LabelName
+	if op == itemCountValues {
+		valueLabel = model.LabelName(ev.evalString(param).Value)
+		if !without {
+			grouping = append(grouping, valueLabel)
+		}
+	}
 
-	for _, sample := range vec {
-		withoutMetric := sample.Metric
+	for _, s := range vec {
+		withoutMetric := s.Metric
 		if without {
 			for _, l := range grouping {
 				withoutMetric.Del(l)
 			}
 			withoutMetric.Del(model.MetricNameLabel)
+			if op == itemCountValues {
+				withoutMetric.Set(valueLabel, model.LabelValue(s.Value.String()))
+			}
+		} else {
+			if op == itemCountValues {
+				s.Metric.Set(valueLabel, model.LabelValue(s.Value.String()))
+			}
 		}
 
 		var groupingKey uint64
 		if without {
 			groupingKey = uint64(withoutMetric.Metric.Fingerprint())
 		} else {
-			groupingKey = model.SignatureForLabels(sample.Metric.Metric, grouping...)
+			groupingKey = model.SignatureForLabels(s.Metric.Metric, grouping...)
 		}
 
 		groupedResult, ok := result[groupingKey]
 		// Add a new group if it doesn't exist.
 		if !ok {
 			var m metric.Metric
-			if keepExtra {
-				m = sample.Metric
+			if keepCommon {
+				m = s.Metric
 				m.Del(model.MetricNameLabel)
 			} else if without {
 				m = withoutMetric
@@ -1043,44 +1146,67 @@ func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without
 					Copied: true,
 				}
 				for _, l := range grouping {
-					if v, ok := sample.Metric.Metric[l]; ok {
+					if v, ok := s.Metric.Metric[l]; ok {
 						m.Set(l, v)
 					}
 				}
 			}
 			result[groupingKey] = &groupedAggregation{
 				labels:           m,
-				value:            sample.Value,
-				valuesSquaredSum: sample.Value * sample.Value,
+				value:            s.Value,
+				valuesSquaredSum: s.Value * s.Value,
 				groupCount:       1,
+			}
+			if op == itemTopK || op == itemQuantile {
+				result[groupingKey].heap = make(vectorByValueHeap, 0, k)
+				heap.Push(&result[groupingKey].heap, &sample{Value: s.Value, Metric: s.Metric})
+			} else if op == itemBottomK {
+				result[groupingKey].reverseHeap = make(vectorByReverseValueHeap, 0, k)
+				heap.Push(&result[groupingKey].reverseHeap, &sample{Value: s.Value, Metric: s.Metric})
 			}
 			continue
 		}
 		// Add the sample to the existing group.
-		if keepExtra {
-			groupedResult.labels = labelIntersection(groupedResult.labels, sample.Metric)
+		if keepCommon {
+			groupedResult.labels = labelIntersection(groupedResult.labels, s.Metric)
 		}
 
 		switch op {
 		case itemSum:
-			groupedResult.value += sample.Value
+			groupedResult.value += s.Value
 		case itemAvg:
-			groupedResult.value += sample.Value
+			groupedResult.value += s.Value
 			groupedResult.groupCount++
 		case itemMax:
-			if groupedResult.value < sample.Value || math.IsNaN(float64(groupedResult.value)) {
-				groupedResult.value = sample.Value
+			if groupedResult.value < s.Value || math.IsNaN(float64(groupedResult.value)) {
+				groupedResult.value = s.Value
 			}
 		case itemMin:
-			if groupedResult.value > sample.Value || math.IsNaN(float64(groupedResult.value)) {
-				groupedResult.value = sample.Value
+			if groupedResult.value > s.Value || math.IsNaN(float64(groupedResult.value)) {
+				groupedResult.value = s.Value
 			}
-		case itemCount:
+		case itemCount, itemCountValues:
 			groupedResult.groupCount++
 		case itemStdvar, itemStddev:
-			groupedResult.value += sample.Value
-			groupedResult.valuesSquaredSum += sample.Value * sample.Value
+			groupedResult.value += s.Value
+			groupedResult.valuesSquaredSum += s.Value * s.Value
 			groupedResult.groupCount++
+		case itemTopK:
+			if len(groupedResult.heap) < k || groupedResult.heap[0].Value < s.Value || math.IsNaN(float64(groupedResult.heap[0].Value)) {
+				if len(groupedResult.heap) == k {
+					heap.Pop(&groupedResult.heap)
+				}
+				heap.Push(&groupedResult.heap, &sample{Value: s.Value, Metric: s.Metric})
+			}
+		case itemBottomK:
+			if len(groupedResult.reverseHeap) < k || groupedResult.reverseHeap[0].Value > s.Value || math.IsNaN(float64(groupedResult.reverseHeap[0].Value)) {
+				if len(groupedResult.reverseHeap) == k {
+					heap.Pop(&groupedResult.reverseHeap)
+				}
+				heap.Push(&groupedResult.reverseHeap, &sample{Value: s.Value, Metric: s.Metric})
+			}
+		case itemQuantile:
+			groupedResult.heap = append(groupedResult.heap, s)
 		default:
 			panic(fmt.Errorf("expected aggregation operator but got %q", op))
 		}
@@ -1093,7 +1219,7 @@ func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without
 		switch op {
 		case itemAvg:
 			aggr.value = aggr.value / model.SampleValue(aggr.groupCount)
-		case itemCount:
+		case itemCount, itemCountValues:
 			aggr.value = model.SampleValue(aggr.groupCount)
 		case itemStdvar:
 			avg := float64(aggr.value) / float64(aggr.groupCount)
@@ -1101,6 +1227,30 @@ func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without
 		case itemStddev:
 			avg := float64(aggr.value) / float64(aggr.groupCount)
 			aggr.value = model.SampleValue(math.Sqrt(float64(aggr.valuesSquaredSum)/float64(aggr.groupCount) - avg*avg))
+		case itemTopK:
+			// The heap keeps the lowest value on top, so reverse it.
+			sort.Sort(sort.Reverse(aggr.heap))
+			for _, v := range aggr.heap {
+				resultVector = append(resultVector, &sample{
+					Metric:    v.Metric,
+					Value:     v.Value,
+					Timestamp: ev.Timestamp,
+				})
+			}
+			continue // Bypass default append.
+		case itemBottomK:
+			// The heap keeps the lowest value on top, so reverse it.
+			sort.Sort(sort.Reverse(aggr.reverseHeap))
+			for _, v := range aggr.reverseHeap {
+				resultVector = append(resultVector, &sample{
+					Metric:    v.Metric,
+					Value:     v.Value,
+					Timestamp: ev.Timestamp,
+				})
+			}
+			continue // Bypass default append.
+		case itemQuantile:
+			aggr.value = model.SampleValue(quantile(q, aggr.heap))
 		default:
 			// For other aggregations, we already have the right value.
 		}

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"golang.org/x/net/context"
 
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/local"
@@ -52,6 +53,8 @@ type Test struct {
 	storage      local.Storage
 	closeStorage func()
 	queryEngine  *Engine
+	context      context.Context
+	cancelCtx    context.CancelFunc
 }
 
 // NewTest returns an initialized empty Test.
@@ -77,6 +80,11 @@ func newTestFromFile(t testutil.T, filename string) (*Test, error) {
 // QueryEngine returns the test's query engine.
 func (t *Test) QueryEngine() *Engine {
 	return t.queryEngine
+}
+
+// Context returns the test's context.
+func (t *Test) Context() context.Context {
+	return t.context
 }
 
 // Storage returns the test's storage.
@@ -411,6 +419,32 @@ func (cmd clearCmd) String() string {
 	return "clear"
 }
 
+// RunAsBenchmark runs the test in benchmark mode.
+// This will not count any loads or non eval functions.
+func (t *Test) RunAsBenchmark(b *Benchmark) error {
+	for _, cmd := range t.cmds {
+
+		switch cmd.(type) {
+		// Only time the "eval" command.
+		case *evalCmd:
+			err := t.exec(cmd)
+			if err != nil {
+				return err
+			}
+		default:
+			if b.iterCount == 0 {
+				b.b.StopTimer()
+				err := t.exec(cmd)
+				if err != nil {
+					return err
+				}
+				b.b.StartTimer()
+			}
+		}
+	}
+	return nil
+}
+
 // Run executes the command sequence of the test. Until the maximum error number
 // is reached, evaluation errors do not terminate execution.
 func (t *Test) Run() error {
@@ -437,7 +471,7 @@ func (t *Test) exec(tc testCommand) error {
 
 	case *evalCmd:
 		q := t.queryEngine.newQuery(cmd.expr, cmd.start, cmd.end, cmd.interval)
-		res := q.Exec()
+		res := q.Exec(t.context)
 		if res.Err != nil {
 			if cmd.fail {
 				return nil
@@ -464,20 +498,21 @@ func (t *Test) clear() {
 	if t.closeStorage != nil {
 		t.closeStorage()
 	}
-	if t.queryEngine != nil {
-		t.queryEngine.Stop()
+	if t.cancelCtx != nil {
+		t.cancelCtx()
 	}
 
 	var closer testutil.Closer
-	t.storage, closer = local.NewTestStorage(t, 1)
+	t.storage, closer = local.NewTestStorage(t, 2)
 
 	t.closeStorage = closer.Close
 	t.queryEngine = NewEngine(t.storage, nil)
+	t.context, t.cancelCtx = context.WithCancel(context.Background())
 }
 
 // Close closes resources associated with the Test.
 func (t *Test) Close() {
-	t.queryEngine.Stop()
+	t.cancelCtx()
 	t.closeStorage()
 }
 
