@@ -66,8 +66,9 @@ func main() {
 	}
 
 	// load base config
-	updateRules(kubeClient, *rulesLocation)
-	reloadRules(*reloadEndpoint)
+	// I think this is uneeded
+	//updateRules(kubeClient, *rulesLocation)
+	//reloadRules(*reloadEndpoint)
 
 	// setup file watcher, will trigger whenever the configmap updates
 
@@ -76,7 +77,10 @@ func main() {
 		log.Printf("Configmaps have updated.\n")
 		check := updateRules(kubeClient, *rulesLocation)
 		if check {
-			reloadRules(*reloadEndpoint)
+			err := reloadRules(*reloadEndpoint)
+			if err != nil {
+				log.Println(err)
+			}
 		}
 	})
 
@@ -116,9 +120,8 @@ func updateRules(kubeClient *kclient.Client, rulesLocation string) bool {
 		}
 		lastSvcSha = newSha
 		return true
-	} else {
-		log.Println("No changes, skipping write.")
 	}
+	log.Println("No changes, skipping write.")
 	return false
 }
 
@@ -137,7 +140,7 @@ func GatherRulesFromConfigmaps(kubeClient *kclient.Client) []string {
 		anno := cm.GetObjectMeta().GetAnnotations()
 		name := cm.GetObjectMeta().GetName()
 
-		for k, _ := range anno {
+		for k := range anno {
 			if k == *configmapAnnotation {
 				log.Printf("Annotation found, processing Configmap - %s\n", name)
 				for cmk, cmv := range cm.Data {
@@ -180,20 +183,21 @@ func processRuleString(rule string) (string, error) {
 	return rule, nil
 }
 
-func reloadRules(url string) {
+func reloadRules(url string) error {
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", url, nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Unable to reload Prometheus config: %s\n", err)
+		return fmt.Errorf("Unable to reload Prometheus config: %s", err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		log.Printf("Prometheus configuration reloaded.")
-	} else {
-		respBody, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
+		return nil
 	}
+
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	return fmt.Errorf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
 }
 
 func createConfigmapLW(kubeClient *kclient.Client) *kcache.ListWatch {
