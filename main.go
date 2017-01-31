@@ -77,10 +77,15 @@ func main() {
 		log.Printf("Configmaps have updated.\n")
 		check := updateRules(kubeClient, *rulesLocation)
 		if check {
-			err := reloadRules(*reloadEndpoint)
-			if err != nil {
-				log.Println(err)
-			}
+			err := try.Do(func(attempt int) (bool, err) {
+				err := reloadRules(*reloadEndpoint)
+				if err != nil {
+					log.Println(err)
+					time.Sleep(10 * time.Second)
+					return false, err
+				}
+				return true, nil
+			})
 		}
 	})
 
