@@ -13,6 +13,8 @@ import (
 
 	//"gopkg.in/yaml.v2"
 
+	"gopkg.in/matryer/try.v1"
+
 	kapi "k8s.io/kubernetes/pkg/api"
 	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -77,7 +79,7 @@ func main() {
 		log.Printf("Configmaps have updated.\n")
 		check := updateRules(kubeClient, *rulesLocation)
 		if check {
-			err := try.Do(func(attempt int) (bool, err) {
+			_ = try.Do(func(attempt int) (bool, error) {
 				err := reloadRules(*reloadEndpoint)
 				if err != nil {
 					log.Println(err)
