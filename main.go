@@ -13,6 +13,7 @@ import (
 
 	//"gopkg.in/yaml.v2"
 
+	"gopkg.in/cheggaaa/mb.v1"
 	"gopkg.in/matryer/try.v1"
 
 	kapi "k8s.io/kubernetes/pkg/api"
@@ -29,6 +30,7 @@ var (
 	configmapAnnotation = flag.String("annotation", os.Getenv("CONFIG_MAP_ANNOTATION"), "Annotation that states that this configmap contains prometheus rules.")
 	rulesLocation       = flag.String("rulespath", os.Getenv("RULES_LOCATION"), "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
 	reloadEndpoint      = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
+	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (default: 5s)")
 
 	helpFlag      = flag.Bool("help", false, "")
 	lastSvcSha    = ""
@@ -67,16 +69,34 @@ func main() {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	// load base config
-	// I think this is uneeded
-	//updateRules(kubeClient, *rulesLocation)
-	//reloadRules(*reloadEndpoint)
+	// setup q for update requests, we'll use this so that we don't spam reloads
+	updateQ := mb.New(50)
 
-	// setup file watcher, will trigger whenever the configmap updates
+	defer updateQ.Close()
+
+	go updateWorker("mainworker", updateQ, kubeClient)
 
 	// setup watcher for configmaps coming and going
 	_ = watchForConfigmaps(kubeClient, func(interface{}) {
-		log.Printf("Configmaps have updated.\n")
+		updateQ.Add(".")
+	})
+
+	defer func() {
+		log.Printf("Cleaning up.")
+	}()
+
+	select {}
+}
+
+func updateWorker(name string, q *mb.MB, kubeClient *kclient.Client) {
+	log.Printf("Worker %s: started\n", name)
+	for {
+		msgs := q.Wait()
+		if len(msgs) == 0 {
+			break
+		}
+
+		log.Printf("Worker %s prossesing %d updates.\n", name, len(msgs))
 		check := updateRules(kubeClient, *rulesLocation)
 		if check {
 			_ = try.Do(func(attempt int) (bool, error) {
@@ -89,13 +109,9 @@ func main() {
 				return true, nil
 			})
 		}
-	})
-
-	defer func() {
-		log.Printf("Cleaning up.")
-	}()
-
-	select {}
+		time.Sleep(time.Second * time.Duration(*batchTime))
+	}
+	log.Printf("Worker %s: closed\n", name)
 }
 
 func updateRules(kubeClient *kclient.Client, rulesLocation string) bool {
