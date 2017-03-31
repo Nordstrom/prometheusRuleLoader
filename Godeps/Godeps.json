@@ -1,10 +1,7 @@
 {
 	"ImportPath": "github.com/nordstrom/prometheusRuleLoader",
-	"GoVersion": "go1.7",
-	"GodepVersion": "v75",
-	"Packages": [
-		"."
-	],
+	"GoVersion": "go1.8",
+	"GodepVersion": "v79",
 	"Deps": [
 		{
 			"ImportPath": "github.com/Sirupsen/logrus",
@@ -262,7 +259,24 @@
 		},
 		{
 			"ImportPath": "golang.org/x/sys/unix",
-			"Rev": "c8bc69bc2db9c57ccf979550bc69655df5039a8a"
+			"Rev": "d75a52659825e75fff6158388dddc6a5b04f9ba5"
+		},
+		{
+			"ImportPath": "golang.org/x/sys/windows",
+			"Rev": "d75a52659825e75fff6158388dddc6a5b04f9ba5"
+		},
+		{
+			"ImportPath": "golang.org/x/sys/windows/registry",
+			"Rev": "d75a52659825e75fff6158388dddc6a5b04f9ba5"
+		},
+		{
+			"ImportPath": "golang.org/x/sys/windows/svc/eventlog",
+			"Rev": "d75a52659825e75fff6158388dddc6a5b04f9ba5"
+		},
+		{
+			"ImportPath": "gopkg.in/cheggaaa/mb.v1",
+			"Comment": "v1.0.1",
+			"Rev": "312dbbaf1029c9a7804b2a856416f78eb5db6a8e"
 		},
 		{
 			"ImportPath": "gopkg.in/fsnotify.v1",
