@@ -30,7 +30,7 @@ var (
 	configmapAnnotation = flag.String("annotation", os.Getenv("CONFIG_MAP_ANNOTATION"), "Annotation that states that this configmap contains prometheus rules.")
 	rulesLocation       = flag.String("rulespath", os.Getenv("RULES_LOCATION"), "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
 	reloadEndpoint      = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
-	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (default: 5s)")
+	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (in seconds, default: 5)")
 
 	helpFlag      = flag.Bool("help", false, "")
 	lastSvcSha    = ""
