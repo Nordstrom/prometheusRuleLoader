@@ -96,7 +96,7 @@ func updateWorker(name string, q *mb.MB, kubeClient *kclient.Client) {
 			break
 		}
 
-		log.Printf("Worker %s prossesing %d updates.\n", name, len(msgs))
+		log.Printf("Worker %s processing %d updates.\n", name, len(msgs))
 		check := updateRules(kubeClient, *rulesLocation)
 		if check {
 			_ = try.Do(func(attempt int) (bool, error) {
