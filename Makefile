@@ -8,6 +8,8 @@ container_release := 2.3
 $(app_name): *.go
 	docker run --rm \
 	  -e CGO_ENABLED=true \
+	  -e LDFLAGS='-extldflags "-static"' \
+	  -e COMPRESS_BINARY=true \
 	  -e OUTPUT=$(app_name) \
 	  -v $(shell pwd):/src:rw \
 	  centurylink/golang-builder
