@@ -134,17 +134,22 @@ func updateRules(kubeClient *kclient.Client, rulesLocation string) bool {
 		log.Printf("Generated rule does not pass: %s.\n%s\n", err, rulesToWrite)
 	}
 
-	// only write and
-	newSha := computeSha1(rulesToWrite)
-	if lastSvcSha != newSha {
-		err = writeRules(rulesToWrite, rulesLocation)
-		if err != nil {
-			log.Printf("%s\n", err)
+	// early out on 0 bytes of rules
+	if len(rulesToWrite) > 0 {
+		// only write and reload if new sha != old sha
+		newSha := computeSha1(rulesToWrite)
+		if lastSvcSha != newSha {
+			err = writeRules(rulesToWrite, rulesLocation)
+			if err != nil {
+				log.Printf("%s\n", err)
+			}
+			lastSvcSha = newSha
+			return true
 		}
-		lastSvcSha = newSha
-		return true
+		log.Println("No changes, skipping write.")
+	} else {
+		log.Println("New rules are 0 bytes, not reloading.")
 	}
-	log.Println("No changes, skipping write.")
 	return false
 }
 
