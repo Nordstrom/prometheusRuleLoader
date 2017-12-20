@@ -1,4 +1,4 @@
-package main //import "github.com/nordstrom/prometheusRuleLoader"
+package main
 
 import (
 	"bufio"
@@ -11,31 +11,71 @@ import (
 	"os"
 	"time"
 
-	//"gopkg.in/yaml.v2"
-
-	"gopkg.in/cheggaaa/mb.v1"
 	"gopkg.in/matryer/try.v1"
+	"gopkg.in/yaml.v2"
 
-	kapi "k8s.io/kubernetes/pkg/api"
-	kcache "k8s.io/kubernetes/pkg/client/cache"
-	kclient "k8s.io/kubernetes/pkg/client/unversioned"
-	kframework "k8s.io/kubernetes/pkg/controller/framework"
-	kselector "k8s.io/kubernetes/pkg/fields"
-	klabels "k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/workqueue"
 )
 
-var (
-	// FLAGS
-	configmapAnnotation = flag.String("annotation", os.Getenv("CONFIG_MAP_ANNOTATION"), "Annotation that states that this configmap contains prometheus rules.")
-	rulesLocation       = flag.String("rulespath", os.Getenv("RULES_LOCATION"), "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
-	reloadEndpoint      = flag.String("endpoint", os.Getenv("PROMETHEUS_RELOAD_ENDPOINT"), "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
-	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (in seconds, default: 5)")
+// Rule ...
+type Rule struct {
+	Record      string            `yaml:"record,omitempty"`
+	Alert       string            `yaml:"alert,omitempty"`
+	Expr        string            `yaml:"expr"`
+	For         string            `yaml:"for,omitempty"`
+	Labels      map[string]string `yaml:"labels"`
+	Annotations map[string]string `yaml:"annotations"`
 
-	helpFlag      = flag.Bool("help", false, "")
-	lastSvcSha    = ""
-	testRule      = "[ \"ALERT helloworldHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'hello-world is down.' }\", \"ALERT itemqueryserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'item-query-service is down.' }\", \"ALERT pointofserviceHealthCounter IF sum(helloWorldHealthCounter) == 0 FOR 1m LABELS { severity = 'critical' } ANNOTATIONS { description = 'point-of-service is down.' }\" ]"
-	annotationKey = flag.String("annotationKey", "nordstrom.net/prometheusAlerts", "Annotation key for prometheus rules")
+	//catchall
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// RuleFile ...
+type RuleFile struct {
+	Groups []RuleGroup `yaml:"groups"`
+
+	//catchall
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// RuleGroup ...
+type RuleGroup struct {
+	Name     string        `yaml:"name"`
+	Rules    []Rule        `yaml:"rules"`
+	Interval time.Duration `yaml:"interval,omitempty"`
+
+	//catchall
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// Controller bye bye error
+type Controller struct {
+	indexer  cache.Indexer
+	queue    workqueue.RateLimitingInterface
+	informer cache.Controller
+}
+
+var (
+	// flags general
+	helpFlag            = flag.Bool("help", false, "")
+	configmapAnnotation = flag.String("annotation", "nordstrom.net/prometheus2Alerts", "Annotation that states that this configmap contains prometheus rules.")
+	rulesLocation       = flag.String("rulespath", "/rules", "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
+	reloadEndpoint      = flag.String("endpoint", "http://localhost:9090/-/reload/", "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
+	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (in seconds, default: 5)")
+	// flags - kubeclient
+	kubeconfigPath = flag.String("kubeconfig", "", "Path to kubeconfig. Required for out of cluster operation.")
+	masterURL      = flag.String("master", "", "The address of the kube api server. Overrides the kubeconfig value, only require for off cluster operation.")
+
+	clientset *kubernetes.Clientset
+	lastSha   string
 )
 
 const (
@@ -55,143 +95,200 @@ func main() {
 		*rulesLocation == "" ||
 		*reloadEndpoint == "" {
 		flag.PrintDefaults()
-		os.Exit(0)
+		os.Exit(1)
 	}
 
-	log.Printf("Rule Updater loaded.\n")
+	log.Printf("Rule Updated loaded.\n")
 	log.Printf("ConfigMap annotation: %s\n", *configmapAnnotation)
 	log.Printf("Rules location: %s\n", *rulesLocation)
 
-	// create client
-	var kubeClient *kclient.Client
-	kubeClient, err := kclient.NewInCluster()
+	config, err := clientcmd.BuildConfigFromFlags(*masterURL, *kubeconfigPath)
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		log.Printf("Error building kubeconfig: %s\n", err.Error())
+		os.Exit(1)
 	}
 
-	// setup q for update requests, we'll use this so that we don't spam reloads
-	updateQ := mb.New(50)
+	clientset, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Printf("Error building client: %s\n", err)
+	}
 
-	defer updateQ.Close()
+	configmapListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "configmaps", v1.NamespaceAll, fields.Everything())
+	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	go updateWorker("mainworker", updateQ, kubeClient)
+	indexer, informer := cache.NewIndexerInformer(configmapListWatcher, &v1.ConfigMap{}, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+		UpdateFunc: func(old interface{}, new interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(new)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(key)
+			}
+		},
+	}, cache.Indexers{})
 
-	// setup watcher for configmaps coming and going
-	_ = watchForConfigmaps(kubeClient, func(interface{}) {
-		updateQ.Add(".")
+	controller := NewController(queue, indexer, informer)
+
+	indexer.Add(&v1.Pod{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "myconfigmap",
+			Namespace: v1.NamespaceDefault,
+		},
 	})
 
-	defer func() {
-		log.Printf("Cleaning up.")
-	}()
+	stop := make(chan struct{})
+	defer close(stop)
+	go controller.Run(1, stop)
 
 	select {}
 }
 
-func updateWorker(name string, q *mb.MB, kubeClient *kclient.Client) {
-	log.Printf("Worker %s: started\n", name)
-	for {
-		msgs := q.Wait()
-		if len(msgs) == 0 {
-			break
-		}
-
-		log.Printf("Worker %s processing %d updates.\n", name, len(msgs))
-		check := updateRules(kubeClient, *rulesLocation)
-		if check {
-			_ = try.Do(func(attempt int) (bool, error) {
-				err := reloadRules(*reloadEndpoint)
-				if err != nil {
-					log.Println(err)
-					time.Sleep(10 * time.Second)
-					return false, err
-				}
-				return true, nil
-			})
-		}
-		time.Sleep(time.Second * time.Duration(*batchTime))
+// NewController make a new Controller
+func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller) *Controller {
+	return &Controller{
+		informer: informer,
+		indexer:  indexer,
+		queue:    queue,
 	}
-	log.Printf("Worker %s: closed\n", name)
 }
 
-func updateRules(kubeClient *kclient.Client, rulesLocation string) bool {
-	log.Println("Processing rules.")
-
-	ruleList := GatherRulesFromConfigmaps(kubeClient)
-
-	var rulesToWrite string
-	for _, rule := range ruleList {
-		content, err := processRuleString(rule)
-		if err != nil {
-			log.Printf("%s", err)
-		} else {
-			rulesToWrite += fmt.Sprintf("%s\n", content)
-		}
+func (c *Controller) processNextItem() bool {
+	// get item from queue
+	key, quit := c.queue.Get()
+	if quit {
+		return false
 	}
 
-	err := CheckRules(rulesToWrite)
+	defer c.queue.Done(key)
+
+	myRuleFile := RuleFile{}
+
+	g, err := c.buildNewRules(key.(string))
 	if err != nil {
-		log.Printf("Generated rule does not pass: %s.\n%s\n", err, rulesToWrite)
+		log.Printf("Unable to build new rules file with error: %s\n", err)
 	}
-
-	// early out on 0 bytes of rules
-	if len(rulesToWrite) > 0 {
-		// only write and reload if new sha != old sha
-		newSha := computeSha1(rulesToWrite)
-		if lastSvcSha != newSha {
-			err = writeRules(rulesToWrite, rulesLocation)
-			if err != nil {
-				log.Printf("%s\n", err)
-			}
-			lastSvcSha = newSha
-			return true
-		}
-		log.Println("No changes, skipping write.")
-	} else {
-		log.Println("New rules are 0 bytes, not reloading.")
+	myRuleFile.Groups = g
+	reloadcheck, err := c.writeFile(&myRuleFile)
+	if reloadcheck {
+		c.tryReloadEndpoint(*reloadEndpoint)
 	}
-	return false
+	time.Sleep(time.Second * time.Duration(*batchTime))
+	return true
 }
 
-func GatherRulesFromConfigmaps(kubeClient *kclient.Client) []string {
-	si := kubeClient.ConfigMaps(kapi.NamespaceAll)
-	mapList, err := si.List(kapi.ListOptions{
-		LabelSelector: klabels.Everything(),
-		FieldSelector: kselector.Everything()})
-	if err != nil {
-		log.Printf("Unable to list configmaps: %s", err)
+// Run ...
+func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
+	defer runtime.HandleCrash()
+
+	// Let the workers stop when we are done
+	defer c.queue.ShutDown()
+	log.Println("Starting Configmap controller")
+
+	go c.informer.Run(stopCh)
+
+	// Wait for all involved caches to be synced, before processing items from the queue is started
+	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
+		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+		return
 	}
 
-	ruleList := []string{}
+	for i := 0; i < threadiness; i++ {
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
 
+	<-stopCh
+	log.Println("Stopping Configmap controller")
+}
+
+func (c *Controller) runWorker() {
+	for c.processNextItem() {
+	}
+}
+
+func (c *Controller) buildNewRules(key string) ([]RuleGroup, error) {
+	groups := []RuleGroup{}
+
+	mapList, err := clientset.CoreV1().ConfigMaps(v1.NamespaceAll).List(meta_v1.ListOptions{})
+	if err != nil {
+		return groups, err
+	}
+
+	c.processConfigMaps(mapList, &groups)
+
+	return groups, nil
+}
+
+func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]RuleGroup) {
 	for _, cm := range mapList.Items {
-		anno := cm.GetObjectMeta().GetAnnotations()
-		name := cm.GetObjectMeta().GetName()
+		om := cm.GetObjectMeta()
+		anno := om.GetAnnotations()
+		name := om.GetName()
+		namespace := om.GetNamespace()
 
 		for k := range anno {
 			if k == *configmapAnnotation {
-				log.Printf("Annotation found, processing Configmap - %s\n", name)
+				log.Printf("Rule configmap found, processing: %s/%s\n", namespace, name)
 				for cmk, cmv := range cm.Data {
-					log.Printf("Found potential rule - %s\n", cmk)
-					ruleList = append(ruleList, cmv)
+					err := c.extractValues(cmk, cmv, groups)
+					if err != nil {
+						log.Printf("Rule %s in configmap %s/%s does not conform to format, skipping. Error: %s\n", cmk, namespace, name, err)
+					}
 				}
 			}
 		}
-
 	}
-
-	return ruleList
 }
 
-func writeRules(rules string, rulesLocation string) error {
-	f, err := os.Create(rulesLocation)
+func (c *Controller) extractValues(key string, value string, groupPtr *[]RuleGroup) error {
+	rg := RuleGroup{}
+	rg.Name = key
+	err := yaml.Unmarshal([]byte(value), &rg.Rules)
 	if err != nil {
-		return fmt.Errorf("Unable to open rules file %s for writing. Error: %s", rulesLocation, err)
+		fmt.Printf("%s\n", err)
+		return err
+	}
+	*groupPtr = append(*groupPtr, rg)
+	return nil
+}
+
+func (c *Controller) writeFile(rules *RuleFile) (bool, error) {
+
+	if len(rules.Groups) > 0 {
+		rulesyaml, err := yaml.Marshal(rules)
+		newSha := c.computeSha1(rulesyaml)
+		if lastSha != newSha {
+			err = c.persistFile(rulesyaml, *rulesLocation)
+			if err != nil {
+				return false, err
+			}
+			lastSha = newSha
+			return true, nil
+		}
+		log.Println("No changes, skipping write.")
+	}
+	log.Println("No rules to write.")
+	return false, nil
+}
+
+func (c *Controller) persistFile(bytes []byte, path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("Unable to open rules file %s for writing. Error: %s", path, err)
 	}
 	defer f.Close()
 
 	w := bufio.NewWriter(f)
-	byteCount, err := w.WriteString(rules)
+	byteCount, err := w.WriteString(string(bytes))
 	if err != nil {
 		return fmt.Errorf("Unable to write generated rules. Error: %s", err)
 	}
@@ -201,17 +298,19 @@ func writeRules(rules string, rulesLocation string) error {
 	return nil
 }
 
-func processRuleString(rule string) (string, error) {
-	err := CheckRules(rule)
-	if err != nil {
-		return "", fmt.Errorf("Rule rejected, Error: %s\n, Rule: %s", err, rule)
-	}
-	log.Printf("Rule passed!\n")
-
-	return rule, nil
+func (c *Controller) tryReloadEndpoint(endpoint string) {
+	_ = try.Do(func(attempt int) (bool, error) {
+		err := c.reloadEndpoint(*reloadEndpoint)
+		if err != nil {
+			log.Println(err)
+			time.Sleep(10 * time.Second)
+			return false, err
+		}
+		return true, nil
+	})
 }
 
-func reloadRules(url string) error {
+func (c *Controller) reloadEndpoint(url string) error {
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", url, nil)
 	resp, err := client.Do(req)
@@ -228,28 +327,8 @@ func reloadRules(url string) error {
 	return fmt.Errorf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
 }
 
-func createConfigmapLW(kubeClient *kclient.Client) *kcache.ListWatch {
-	return kcache.NewListWatchFromClient(kubeClient, "configmaps", kapi.NamespaceAll, kselector.Everything())
-}
-
-func watchForConfigmaps(kubeClient *kclient.Client, callback func(interface{})) kcache.Store {
-	configmapStore, configmapController := kframework.NewInformer(
-		createConfigmapLW(kubeClient),
-		&kapi.ConfigMap{},
-		0,
-		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    callback,
-			DeleteFunc: callback,
-			UpdateFunc: func(a interface{}, b interface{}) { callback(b) },
-		},
-	)
-	go configmapController.Run(wait.NeverStop)
-	return configmapStore
-}
-
-func computeSha1(payload string) string {
+func (c *Controller) computeSha1(s []byte) string {
 	hash := sha1.New()
-	hash.Write([]byte(payload))
-
+	hash.Write(s)
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
