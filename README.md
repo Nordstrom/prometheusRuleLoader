@@ -12,14 +12,14 @@ Parameters
 *  `-annotation` - Used to customize the annotation label you'd like the rule loader to look like on your configmaps.
 *  `-rulespath` - The location you would like your rules to be written to. Should correspond to a rule_files path in your prometheus config.
 *  `-endpoint` - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
-*  `-batchtime` - Configure how long you want it to sleep between reload attempts, if your configmaps churn a lot it can cause excessive reloads on prometheus.
+*  `-batchtime` - Configure how long you want it to sleep between reload attempts in seconds, if your configmaps churn a lot it can cause excessive reloads on prometheus.
 *  `-kubeconfig` - Use a kubeconfig to configure the connection to the api server, off cluster use only.
 *  `master` - Address of the master server, overrides server in kubeconfig. For off cluster use only.
 
 
 for example:
 
-`./PrometheusRuleLoader -rulespath ./rules.rules -annotation 'prometheus.io/v2/rules' -endpoint http://127.0.0.1/-/reload`
+`./PrometheusRuleLoader -rulespath ./rules.rules -annotation 'prometheus.io/v2/rules' -endpoint http://127.0.0.1:9090/-/reload`
 
 Configmap Annotation
 ====================

@@ -1,4 +1,4 @@
-package main
+package main //import "github.com/nordstrom/prometheusRuleLoader"
 
 import (
 	"bufio"
