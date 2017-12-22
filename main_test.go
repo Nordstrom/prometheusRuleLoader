@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/prometheus/prometheus/pkg/rulefmt"
 	. "github.com/smartystreets/goconvey/convey"
 	"k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,7 +27,7 @@ func TestExtractValues(t *testing.T) {
     severity: page
   annotations:
     summary: High request latency`
-	groups := make([]RuleGroup, 0)
+	groups := make([]rulefmt.RuleGroup, 0)
 
 	Convey("Extract Recording and Alert rules", t, func() {
 		name := "test"
@@ -42,6 +43,35 @@ func TestExtractValues(t *testing.T) {
 		So(groups[0].Rules[0].Record, ShouldContainSubstring, "job:http")
 		So(groups[0].Rules[1].Alert, ShouldEqual, "HighErrorRate")
 	})
+}
+
+func TestBadRule(t *testing.T) {
+	cm1d := map[string]string{
+		"test": `- record: job:http_inprogress_requests:sum
+  expr: sum(http_inprogress_requests) by (job)`,
+		"test2": `garbage`,
+		"test3": `- record: fail`,
+	}
+	cm1m := meta_v1.ObjectMeta{
+		Name:        "configmap_one",
+		Namespace:   "one",
+		Annotations: map[string]string{"nordstrom.net/prometheus2Alerts": "true"},
+	}
+	cm1 := v1.ConfigMap{
+		Data:       cm1d,
+		ObjectMeta: cm1m,
+	}
+
+	cmList := v1.ConfigMapList{Items: []v1.ConfigMap{cm1}}
+
+	Convey("Processing list of configmaps", t, func() {
+		groups := []rulefmt.RuleGroup{}
+		c.processConfigMaps(&cmList, &groups)
+
+		So(len(groups), ShouldEqual, 1)
+		So(groups[0].Name, ShouldEqual, "test")
+	})
+
 }
 
 func TestCreateFile(t *testing.T) {
@@ -88,7 +118,7 @@ func TestCreateFile(t *testing.T) {
 	cmList := v1.ConfigMapList{Items: []v1.ConfigMap{cm1, cm2, cm3}}
 
 	Convey("Processing list of configmaps", t, func() {
-		groups := []RuleGroup{}
+		groups := []rulefmt.RuleGroup{}
 		c.processConfigMaps(&cmList, &groups)
 
 		So(len(groups), ShouldEqual, 2)
