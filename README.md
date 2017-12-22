@@ -1,8 +1,10 @@
+### New version contains breaking changes, see *Changes* below
+
+Handy Kubernetes sidecar for Prometheus 2.x. It watches for configmaps in all namespaces that have the annotation specified with the -annotation flag. When it finds one it pulls each value out and assumes it's a prometheus rule. It then validates them and adds them to a the rules file specified with -rulespath. If that file changes it hits the reload endpoint specified by the -endpoint flag. 
+
 Changes
 =======
-* New 2.0 version, breaking changes! Moved rules from service annotations to configmaps (we just think it's way cleaner now)
-
-Handy Kubernetes sidecar for prometheus. It watches for configmaps in all namespaces that have the annotation specified with the -annotation flag. When it finds one it pulls each value out and assumes it's a prometheus rule. It then validates them and adds them to a the rules file specified with -rulespath. If that file changes it hits the reload endpoint specified by the -endpoint flag. 
+* New 3.0 version, breaking changes! This works with the new prometheus 2 rules only, if you want to use the rule loader with prometheus 1.x please use the `prom1.x-stable` tag.
 
 Parameters
 ==========
@@ -10,16 +12,14 @@ Parameters
 *  `-annotation` - Used to customize the annotation label you'd like the rule loader to look like on your configmaps.
 *  `-rulespath` - The location you would like your rules to be written to. Should correspond to a rule_files path in your prometheus config.
 *  `-endpoint` - Endpoint to make a bodyless POST request to (Prometheus uses /-/reload)
+*  `-batchtime` - Configure how long you want it to sleep between reload attempts in seconds, if your configmaps churn a lot it can cause excessive reloads on prometheus.
+*  `-kubeconfig` - Use a kubeconfig to configure the connection to the api server, off cluster use only.
+*  `master` - Address of the master server, overrides server in kubeconfig. For off cluster use only.
 
-All of these parameters will by default use the following envriomental variables:
-
-* annotation defaults to 'CONFIG_MAP_ANNOTATION'
-* rulespath defaults to 'RULES_LOCATION'
-* endpoint defaults to 'PROMETHEUS_RELOAD_ENDPOINT'
 
 for example:
 
-./PrometheusRuleLoader -rulespath ./rules.rules -annotation 'prometheus.io/rules' -endpoint http://prometheus.kube-system.cluster.local/-/reload
+`./PrometheusRuleLoader -rulespath ./rules.rules -annotation 'prometheus.io/v2/rules' -endpoint http://127.0.0.1:9090/-/reload`
 
 Configmap Annotation
 ====================
@@ -34,33 +34,21 @@ metadata:
   labels:
     app: "prometheus"
   annotations: {
-    "prometheus.io/rules": "true"
+    "prometheus.io/v2/rules": "true"
   }
 data:
-  toomanyfoos: |
-    ALERT TooManyFoosToFast
-    IF sum(rate(fooCounter[1m])) > 1
-    FOR 1m
-    LABELS { severity = "warning" }
-    ANNOTATIONS {
-      description = "Rate of foo very high ({{ $value }})."
-    }
-  waytoomanyfoos: |
-    ALERT WayToManyFoosToFast
-    IF sum(rate(fooCounter[1m])) > 5
-    FOR 1m
-    LABELS { severity = "critical" }
-    ANNOTATIONS {
-      description = "Rate of foo critically high ({{ $value }})."
-    }
-
-
+  mygroupname: |
+    - record: job:http_inprogress_requests:sum
+      expr: sum(http_inprogress_requests) by (job)
+    - alert: HighErrorRate
+      expr: job:request_latency_seconds:mean5m{job="myjob"} > 0.5
+      for: 10m
+      labels:
+        severity: page
+      annotations:
+        summary: High request latency
 ```
 
 Deployment
 ==========
-PrometheusRuleLoaders docker container should be deployed int he same pod as prometheus. They should both share a volume mount (and emptydir works fine here). PrometheusRuleLoader will use this shared space to write it's rule file to, meanwhile Prometheus should be configured to look for it's rule file at this path.
-
-Other Notes
-===========
-Every rule is verified and only ones that pass are added to the configuration files. If you see a rule failing to pass you can use the promtool that ships with prometheus to verify it.
+The PrometheusRuleLoaders docker container should be deployed in the same pod as prometheus. They should both share a volume mount (and emptydir works fine here). PrometheusRuleLoader will use this shared space to write it's rule file to, meanwhile Prometheus should be configured to look for it's rule file at this path.
