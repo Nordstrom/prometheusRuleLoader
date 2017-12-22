@@ -11,6 +11,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/prometheus/pkg/rulefmt"
+
 	"gopkg.in/matryer/try.v1"
 	"gopkg.in/yaml.v2"
 
@@ -24,37 +26,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 )
-
-// Rule ...
-type Rule struct {
-	Record      string            `yaml:"record,omitempty"`
-	Alert       string            `yaml:"alert,omitempty"`
-	Expr        string            `yaml:"expr"`
-	For         string            `yaml:"for,omitempty"`
-	Labels      map[string]string `yaml:"labels"`
-	Annotations map[string]string `yaml:"annotations"`
-
-	//catchall
-	XXX map[string]interface{} `yaml:",inline"`
-}
-
-// RuleFile ...
-type RuleFile struct {
-	Groups []RuleGroup `yaml:"groups"`
-
-	//catchall
-	XXX map[string]interface{} `yaml:",inline"`
-}
-
-// RuleGroup ...
-type RuleGroup struct {
-	Name     string        `yaml:"name"`
-	Rules    []Rule        `yaml:"rules"`
-	Interval time.Duration `yaml:"interval,omitempty"`
-
-	//catchall
-	XXX map[string]interface{} `yaml:",inline"`
-}
 
 // Controller bye bye error
 type Controller struct {
@@ -171,7 +142,7 @@ func (c *Controller) processNextItem() bool {
 
 	defer c.queue.Done(key)
 
-	myRuleFile := RuleFile{}
+	myRuleFile := rulefmt.RuleGroups{}
 
 	g, err := c.buildNewRules(key.(string))
 	if err != nil {
@@ -215,8 +186,8 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func (c *Controller) buildNewRules(key string) ([]RuleGroup, error) {
-	groups := []RuleGroup{}
+func (c *Controller) buildNewRules(key string) ([]rulefmt.RuleGroup, error) {
+	groups := []rulefmt.RuleGroup{}
 
 	mapList, err := clientset.CoreV1().ConfigMaps(v1.NamespaceAll).List(meta_v1.ListOptions{})
 	if err != nil {
@@ -228,7 +199,7 @@ func (c *Controller) buildNewRules(key string) ([]RuleGroup, error) {
 	return groups, nil
 }
 
-func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]RuleGroup) {
+func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]rulefmt.RuleGroup) {
 	for _, cm := range mapList.Items {
 		om := cm.GetObjectMeta()
 		anno := om.GetAnnotations()
@@ -249,19 +220,27 @@ func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]Rule
 	}
 }
 
-func (c *Controller) extractValues(key string, value string, groupPtr *[]RuleGroup) error {
-	rg := RuleGroup{}
+func (c *Controller) extractValues(key string, value string, groupPtr *[]rulefmt.RuleGroup) error {
+	rg := rulefmt.RuleGroup{}
 	rg.Name = key
 	err := yaml.Unmarshal([]byte(value), &rg.Rules)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return err
 	}
+	errs := checkRules(&rg)
+	if len(errs) > 0 {
+		myError := fmt.Errorf("Rule validataion errors, skipping key : ")
+		for _, e := range errs {
+			myError = fmt.Errorf("%s %s", myError, e)
+		}
+		return myError
+	}
 	*groupPtr = append(*groupPtr, rg)
 	return nil
 }
 
-func (c *Controller) writeFile(rules *RuleFile) (bool, error) {
+func (c *Controller) writeFile(rules *rulefmt.RuleGroups) (bool, error) {
 
 	if len(rules.Groups) > 0 {
 		rulesyaml, err := yaml.Marshal(rules)
