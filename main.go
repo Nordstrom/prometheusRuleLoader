@@ -11,6 +11,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
 
 	"gopkg.in/matryer/try.v1"
@@ -44,9 +46,30 @@ var (
 	// flags - kubeclient
 	kubeconfigPath = flag.String("kubeconfig", "", "Path to kubeconfig. Required for out of cluster operation.")
 	masterURL      = flag.String("master", "", "The address of the kube api server. Overrides the kubeconfig value, only require for off cluster operation.")
+	// flags - metrics server
+	listenport = flag.Int("port", 80, "Port for prometheus metrics exposure.")
 
 	clientset *kubernetes.Clientset
 	lastSha   string
+
+	// metrics
+	reloads = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ruleloader_reloads_sucess",
+			Help: "number of reloads",
+		})
+
+	failedReloads = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ruleloader_reloads_failed",
+			Help: "number of reloads failed",
+		})
+
+	failedRules = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ruleloader_rulevalidation_failures",
+			Help: "rule validation failure counter",
+		})
 )
 
 const (
@@ -57,6 +80,12 @@ const (
 	// A subdomain added to the user specified dmoain for all pods.
 	podSubdomain = "pod"
 )
+
+func init() {
+	prometheus.MustRegister(reloads)
+	prometheus.MustRegister(failedReloads)
+	prometheus.MustRegister(failedRules)
+}
 
 func main() {
 	flag.Parse()
@@ -119,6 +148,11 @@ func main() {
 
 	stop := make(chan struct{})
 	defer close(stop)
+
+	addr := fmt.Sprintf(":%d", *listenport)
+	http.Handle("/metrics", promhttp.Handler())
+	log.Fatal(http.ListenAndServe(addr, nil))
+
 	go controller.Run(1, stop)
 
 	select {}
@@ -230,6 +264,7 @@ func (c *Controller) extractValues(key string, value string, groupPtr *[]rulefmt
 	}
 	errs := checkRules(&rg)
 	if len(errs) > 0 {
+		failedRules.Add(float64(len(errs)))
 		myError := fmt.Errorf("Rule validataion errors, skipping key : ")
 		for _, e := range errs {
 			myError = fmt.Errorf("%s %s", myError, e)
@@ -281,10 +316,12 @@ func (c *Controller) tryReloadEndpoint(endpoint string) {
 	_ = try.Do(func(attempt int) (bool, error) {
 		err := c.reloadEndpoint(*reloadEndpoint)
 		if err != nil {
+			failedReloads.Inc()
 			log.Println(err)
 			time.Sleep(10 * time.Second)
 			return false, err
 		}
+		reloads.Inc()
 		return true, nil
 	})
 }

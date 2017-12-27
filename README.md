@@ -4,7 +4,12 @@ Handy Kubernetes sidecar for Prometheus 2.x. It watches for configmaps in all na
 
 Changes
 =======
+* New 3.2 version. Added prometheus counters for, successful reloads, failed reloads and number of rule validation failures.
+
+* New 3.1 version. Added back in rule validation, currently works on a group level (i.e. each key in a configmap is a group). If one rule in a group fails the group fails.
+
 * New 3.0 version, breaking changes! This works with the new prometheus 2 rules only, if you want to use the rule loader with prometheus 1.x please use the `prom1.x-stable` tag.
+
 
 Parameters
 ==========
