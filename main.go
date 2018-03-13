@@ -82,9 +82,12 @@ func main() {
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Printf("Error building client: %s\n", err)
+		os.Exit(1)
 	}
 
+	log.Println("Building list watcher")
 	configmapListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "configmaps", v1.NamespaceAll, fields.Everything())
+	log.Println("Building queue")
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
 	indexer, informer := cache.NewIndexerInformer(configmapListWatcher, &v1.ConfigMap{}, 0, cache.ResourceEventHandlerFuncs{
@@ -119,6 +122,7 @@ func main() {
 
 	stop := make(chan struct{})
 	defer close(stop)
+	log.Println("Starting controller...")
 	go controller.Run(1, stop)
 
 	select {}
@@ -210,7 +214,7 @@ func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]rule
 			if k == *configmapAnnotation {
 				log.Printf("Rule configmap found, processing: %s/%s\n", namespace, name)
 				for cmk, cmv := range cm.Data {
-					err := c.extractValues(cmk, cmv, groups)
+					err := c.extractValues(name, namespace, cmk, cmv, groups)
 					if err != nil {
 						log.Printf("Rule %s in configmap %s/%s does not conform to format, skipping. Error: %s\n", cmk, namespace, name, err)
 					}
@@ -220,9 +224,9 @@ func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]rule
 	}
 }
 
-func (c *Controller) extractValues(key string, value string, groupPtr *[]rulefmt.RuleGroup) error {
+func (c *Controller) extractValues(cmname string, namespace string, key string, value string, groupPtr *[]rulefmt.RuleGroup) error {
 	rg := rulefmt.RuleGroup{}
-	rg.Name = key
+	rg.Name = fmt.Sprintf("%s-%s-%s", namespace, cmname, key)
 	err := yaml.Unmarshal([]byte(value), &rg.Rules)
 	if err != nil {
 		fmt.Printf("%s\n", err)
