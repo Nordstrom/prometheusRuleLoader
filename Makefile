@@ -1,6 +1,6 @@
 app_name := prometheusRuleLoader
 container_name := prometheusruleloader
-container_registry := quay.io/nordstrom
+container_registry := gitlab-registry.nordstrom.com/k8s/platform-bootstrap
 container_release := 3.01
 
 .PHONY: build build_image release_image
