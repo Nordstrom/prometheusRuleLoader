@@ -228,6 +228,8 @@ func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList) (MultiRuleGrou
 				if err != nil {
 					errors = append(errors, err)
 				}
+
+
 				ruleGroups.Values = append(ruleGroups.Values, g.Values...)
 
 			}
@@ -255,12 +257,18 @@ func (c *Controller) extractValues(fallbackNameStub string, data map[string]stri
 				if err != nil {
 					myerrors = append(myerrors, fmt.Errorf("Configmap: %s  key: %s does not conform to any of the legal formapts (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key))
 				} else {
+					myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
+					myerrors = append(myerrors,err)
 					mrg.Values = append(mrg.Values, myrulegroups)
 				}
 			} else {
 				mrg.Values = append(mrg.Values, myrulegroups)
+				myerrors = append(myerrors,err)
+				mrg.Values = append(mrg.Values, myrulegroups)
 			}
 		} else {
+			mrg.Values = append(mrg.Values, myrulegroups)
+			myerrors = append(myerrors,err)
 			mrg.Values = append(mrg.Values, myrulegroups)
 		}
 	}
@@ -322,6 +330,40 @@ func (c *Controller) extractRuleGroups(value string) (error, rulefmt.RuleGroups)
 	return nil, groups
 }
 
+func (c *Controller) validateRuleGroups(fallbackname string, keyname string, groups rulefmt.RuleGroups) (rulefmt.RuleGroups, error) {
+
+	// im not using rulegroups.Validate here because i think their current error processing is broken.
+	errors := make([]error,0)
+	for _, group := range groups.Groups {
+
+		for i, r := range group.Rules {
+			remove := make([]int,0)
+			for _, err := range r.Validate() {
+				if err != nil {
+					remove = append(remove, i)
+					name := r.Alert
+					if name == "" {
+						name = r.Record
+					}
+					myerror := fmt.Errorf("Rule failed validation: configmap:%s, key:%s, groupname: %s, rulename: %s Error: %s", fallbackname, keyname, group.Name, name, err)
+					errors = append(errors, myerror)
+				}
+				c.removeRules(&group, remove)
+			}
+		}
+	}
+
+	reterr := assembleErrors(errors)
+
+	return groups, reterr
+}
+
+func (c *Controller) removeRules(group *rulefmt.RuleGroup, list []int) {
+	for i := len(list)-1; i >=0; i-- {
+		v := list[i]
+		group.Rules = append(group.Rules[:v], group.Rules[v+1:]...)
+	}
+}
 
 func (c *Controller) writeFile(groups MultiRuleGroups) (bool, error) {
 
