@@ -255,7 +255,7 @@ func (c *Controller) extractValues(fallbackNameStub string, data map[string]stri
 				// try rules array
 				err, myrulegroups := c.extractRulesAsRuleGroups(fallbackNameStub, key, value)
 				if err != nil {
-					myerrors = append(myerrors, fmt.Errorf("Configmap: %s  key: %s does not conform to any of the legal formapts (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key))
+					myerrors = append(myerrors, fmt.Errorf("Configmap: %s  key: %s does not conform to any of the legal formats (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key))
 				} else {
 					myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
 					if err != nil {
@@ -451,8 +451,13 @@ func (c *Controller) computeSha1(s []byte) string {
 func assembleErrors(myerrors []error) error {
 	errorstring := ""
 	for _, v := range myerrors {
-		errorstring = fmt.Sprintf("%s, %s", errorstring, v)
+		if errorstring != "" {
+			errorstring = fmt.Sprintf("%s, %s", errorstring, v)
+		} else {
+			errorstring = fmt.Sprintf("%s",v)
+		}
 	}
+
 	if len(errorstring) > 0 {
 		return fmt.Errorf(errorstring)
 	}
