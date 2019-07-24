@@ -258,17 +258,23 @@ func (c *Controller) extractValues(fallbackNameStub string, data map[string]stri
 					myerrors = append(myerrors, fmt.Errorf("Configmap: %s  key: %s does not conform to any of the legal formapts (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key))
 				} else {
 					myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
-					myerrors = append(myerrors,err)
+					if err != nil {
+						myerrors = append(myerrors,err)
+					}
 					mrg.Values = append(mrg.Values, myrulegroups)
 				}
 			} else {
-				mrg.Values = append(mrg.Values, myrulegroups)
-				myerrors = append(myerrors,err)
+				myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
+				if err != nil {
+					myerrors = append(myerrors,err)
+				}
 				mrg.Values = append(mrg.Values, myrulegroups)
 			}
 		} else {
-			mrg.Values = append(mrg.Values, myrulegroups)
-			myerrors = append(myerrors,err)
+			myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
+			if err != nil {
+				myerrors = append(myerrors,err)
+			}
 			mrg.Values = append(mrg.Values, myrulegroups)
 		}
 	}
