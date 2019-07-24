@@ -49,6 +49,10 @@ data:
         summary: High request latency
 ```
 
+The value of the configmap that contains rules can either be in the format of []Rules, RuleGroup, or RuleGroups as detailed in `github.com/prometheus/prometheus/pkg/rulefmt`. If the values are in the []Rules format a group will be created around them and named `configmapnamespace-configmapname-key`.
+
+Once all the appropriate configmaps are processed all the groups will be assembled into a single rule file named `-rulespath`.
+
 Deployment
 ==========
 The PrometheusRuleLoaders docker container should be deployed in the same pod as prometheus. They should both share a volume mount (and emptydir works fine here). PrometheusRuleLoader will use this shared space to write it's rule file to, meanwhile Prometheus should be configured to look for it's rule file at this path.

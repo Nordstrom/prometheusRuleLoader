@@ -1,11 +1,10 @@
 language: go
 
 go:
-  - tip
+  - 1.x
 
-install:
-  - go get -t ./...
+env:
+- GO111MODULE=on
 
-script: go test -v
-
-sudo: false
+script:
+- make build

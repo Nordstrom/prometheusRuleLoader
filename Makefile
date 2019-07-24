@@ -1,20 +1,17 @@
 app_name := prometheusRuleLoader
 container_name := prometheusruleloader
 container_registry := gitlab-registry.nordstrom.com/k8s/platform-bootstrap
-container_release := 3.01
+container_release := 4.0
 
-.PHONY: build build_image release_image
+.PHONY: build tag/image push/image clean
 
-$(app_name): *.go
-	docker run --rm \
-	  -e CGO_ENABLED=true \
-	  -e LDFLAGS='-extldflags "-static"' \
-	  -e COMPRESS_BINARY=true \
-	  -e OUTPUT=$(app_name) \
-	  -v $(shell pwd):/src:rw \
-	  centurylink/golang-builder
+build/linux/$(app_name): *.go | build
+	GOOS=linux GOARCH=amd64 go build -o $@ .
 
-build/image: $(app_name) Dockerfile
+build/darwin/$(app_name): *.go | build
+	GOOS=darwin GOARCH=amd64 go build -o $@ .
+
+build/image: build/linux/$(app_name) Dockerfile
 	docker build \
 		-t $(container_name) .
 
@@ -23,3 +20,9 @@ tag/image: build/image
 
 push/image: tag/image
 	docker push $(container_registry)/$(container_name):$(container_release)
+
+build:
+	mkdir -p build/linux build/darwin
+
+clean:
+	rm -rf build

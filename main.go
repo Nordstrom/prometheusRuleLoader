@@ -34,6 +34,10 @@ type Controller struct {
 	informer cache.Controller
 }
 
+type MultiRuleGroups struct {
+	Values []rulefmt.RuleGroups
+}
+
 var (
 	// flags general
 	helpFlag            = flag.Bool("help", false, "")
@@ -46,7 +50,7 @@ var (
 	masterURL      = flag.String("master", "", "The address of the kube api server. Overrides the kubeconfig value, only require for off cluster operation.")
 
 	clientset *kubernetes.Clientset
-	lastSha   string
+	lastSha  string
 )
 
 const (
@@ -113,7 +117,7 @@ func main() {
 
 	controller := NewController(queue, indexer, informer)
 
-	indexer.Add(&v1.Pod{
+	indexer.Add(&v1.ConfigMap{
 		ObjectMeta: meta_v1.ObjectMeta{
 			Name:      "myconfigmap",
 			Namespace: v1.NamespaceDefault,
@@ -146,16 +150,17 @@ func (c *Controller) processNextItem() bool {
 
 	defer c.queue.Done(key)
 
-	myRuleFile := rulefmt.RuleGroups{}
-
-	g, err := c.buildNewRules(key.(string))
+	configmapRuleGroups, err := c.buildNewRules()
 	if err != nil {
 		log.Printf("Unable to build new rules file with error: %s\n", err)
 	}
-	myRuleFile.Groups = g
-	reloadcheck, err := c.writeFile(&myRuleFile)
+
+	reloadcheck, err := c.writeFile(configmapRuleGroups)
 	if reloadcheck {
 		c.tryReloadEndpoint(*reloadEndpoint)
+	}
+	if err != nil {
+		fmt.Println(err)
 	}
 	time.Sleep(time.Second * time.Duration(*batchTime))
 	return true
@@ -190,64 +195,185 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func (c *Controller) buildNewRules(key string) ([]rulefmt.RuleGroup, error) {
-	groups := []rulefmt.RuleGroup{}
+func (c *Controller) buildNewRules() ( MultiRuleGroups, error) {
 
 	mapList, err := clientset.CoreV1().ConfigMaps(v1.NamespaceAll).List(meta_v1.ListOptions{})
 	if err != nil {
-		return groups, err
+		return MultiRuleGroups{}, err
 	}
 
-	c.processConfigMaps(mapList, &groups)
+	ruleGroups, err := c.processConfigMaps(mapList)
+	if err != nil {
+		fmt.Println(err)
+	}
 
-	return groups, nil
+	return ruleGroups, nil
 }
 
-func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList, groups *[]rulefmt.RuleGroup) {
+func (c *Controller) processConfigMaps(mapList *v1.ConfigMapList) (MultiRuleGroups, error) {
+	ruleGroups := MultiRuleGroups{}
+	errors := make([]error, 0)
+
 	for _, cm := range mapList.Items {
-		om := cm.GetObjectMeta()
-		anno := om.GetAnnotations()
-		name := om.GetName()
-		namespace := om.GetNamespace()
+		anno := cm.GetObjectMeta().GetAnnotations()
+		name := cm.GetObjectMeta().GetName()
+		namespace := cm.GetObjectMeta().GetNamespace()
+
 
 		for k := range anno {
 			if k == *configmapAnnotation {
 				log.Printf("Rule configmap found, processing: %s/%s\n", namespace, name)
-				for cmk, cmv := range cm.Data {
-					err := c.extractValues(name, namespace, cmk, cmv, groups)
-					if err != nil {
-						log.Printf("Rule %s in configmap %s/%s does not conform to format, skipping. Error: %s\n", cmk, namespace, name, err)
-					}
+
+				g, err := c.extractValues( fmt.Sprintf("%s-%s", namespace, name), cm.Data )
+				if err != nil {
+					errors = append(errors, err)
 				}
+
+
+				ruleGroups.Values = append(ruleGroups.Values, g.Values...)
+
 			}
 		}
 	}
+	reterr := assembleErrors(errors)
+
+	return ruleGroups, reterr
 }
 
-func (c *Controller) extractValues(cmname string, namespace string, key string, value string, groupPtr *[]rulefmt.RuleGroup) error {
-	rg := rulefmt.RuleGroup{}
-	rg.Name = fmt.Sprintf("%s-%s-%s", namespace, cmname, key)
-	err := yaml.Unmarshal([]byte(value), &rg.Rules)
-	if err != nil {
-		fmt.Printf("%s\n", err)
-		return err
-	}
-	errs := checkRules(&rg)
-	if len(errs) > 0 {
-		myError := fmt.Errorf("Rule validataion errors, skipping key : ")
-		for _, e := range errs {
-			myError = fmt.Errorf("%s %s", myError, e)
+func (c *Controller) extractValues(fallbackNameStub string, data map[string]string) (MultiRuleGroups, error) {
+
+	// make a bucket for random non fully formed rulegroups (just a single rulegroup) to live
+	mrg := MultiRuleGroups{}
+	myerrors := make([]error,0)
+	for key, value := range data {
+		// fallback decoding, first try extracting a RuleGroups, then a RuleGroup, then []Rule
+		err, myrulegroups := c.extractRuleGroups(value)
+		if err != nil {
+			// try rulegroup
+			err, myrulegroups := c.extractRuleGroupAsRuleGroups(value)
+			if err != nil {
+				// try rules array
+				err, myrulegroups := c.extractRulesAsRuleGroups(fallbackNameStub, key, value)
+				if err != nil {
+					myerrors = append(myerrors, fmt.Errorf("Configmap: %s  key: %s does not conform to any of the legal formapts (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key))
+				} else {
+					myrulegroups, err = c.validateRuleGroups(fallbackNameStub, key, myrulegroups)
+					myerrors = append(myerrors,err)
+					mrg.Values = append(mrg.Values, myrulegroups)
+				}
+			} else {
+				mrg.Values = append(mrg.Values, myrulegroups)
+				myerrors = append(myerrors,err)
+				mrg.Values = append(mrg.Values, myrulegroups)
+			}
+		} else {
+			mrg.Values = append(mrg.Values, myrulegroups)
+			myerrors = append(myerrors,err)
+			mrg.Values = append(mrg.Values, myrulegroups)
 		}
-		return myError
 	}
-	*groupPtr = append(*groupPtr, rg)
-	return nil
+
+	reterr := assembleErrors(myerrors)
+
+
+	return mrg, reterr
 }
 
-func (c *Controller) writeFile(rules *rulefmt.RuleGroups) (bool, error) {
+func (c *Controller) extractRulesAsRuleGroups(fallbackName string, key string, value string) (error, rulefmt.RuleGroups){
+	rules := make([]rulefmt.Rule,0)
+	err := yaml.Unmarshal([]byte(value), &rules)
+	if err != nil {
+		return err, rulefmt.RuleGroups{}
+	}
+	if len(rules) == 0 {
+		return fmt.Errorf("No rules"), rulefmt.RuleGroups{}
+	}
 
-	if len(rules.Groups) > 0 {
-		rulesyaml, err := yaml.Marshal(rules)
+	rgName := fmt.Sprintf("%s-%s", fallbackName, key)
+	rg := rulefmt.RuleGroup{}
+	rg.Name = rgName
+	rg.Rules = rules
+
+	wrapper := rulefmt.RuleGroups{}
+	wrapper.Groups = append(wrapper.Groups, rg)
+
+	return nil, wrapper
+}
+
+
+func (c *Controller) extractRuleGroupAsRuleGroups(value string) (error, rulefmt.RuleGroups) {
+	group := rulefmt.RuleGroup{}
+	err := yaml.Unmarshal([]byte(value), &group)
+	if err != nil {
+		return err, rulefmt.RuleGroups{}
+	}
+	if len(group.Rules) == 0 {
+		return fmt.Errorf("No RuleGroup"), rulefmt.RuleGroups{}
+	}
+
+	wrapper := rulefmt.RuleGroups{}
+	wrapper.Groups = append(wrapper.Groups, group)
+
+	return nil, wrapper
+}
+
+func (c *Controller) extractRuleGroups(value string) (error, rulefmt.RuleGroups) {
+	groups := rulefmt.RuleGroups{}
+	err := yaml.Unmarshal([]byte(value), &groups)
+	if err != nil {
+		return err, rulefmt.RuleGroups{}
+	}
+	if len(groups.Groups) == 0 {
+		return fmt.Errorf("No RuleGroups"), groups
+	}
+
+	return nil, groups
+}
+
+func (c *Controller) validateRuleGroups(fallbackname string, keyname string, groups rulefmt.RuleGroups) (rulefmt.RuleGroups, error) {
+
+	// im not using rulegroups.Validate here because i think their current error processing is broken.
+	errors := make([]error,0)
+	for _, group := range groups.Groups {
+
+		for i, r := range group.Rules {
+			remove := make([]int,0)
+			for _, err := range r.Validate() {
+				if err != nil {
+					remove = append(remove, i)
+					name := r.Alert
+					if name == "" {
+						name = r.Record
+					}
+					myerror := fmt.Errorf("Rule failed validation: configmap:%s, key:%s, groupname: %s, rulename: %s Error: %s", fallbackname, keyname, group.Name, name, err)
+					errors = append(errors, myerror)
+				}
+				c.removeRules(&group, remove)
+			}
+		}
+	}
+
+	reterr := assembleErrors(errors)
+
+	return groups, reterr
+}
+
+func (c *Controller) removeRules(group *rulefmt.RuleGroup, list []int) {
+	for i := len(list)-1; i >=0; i-- {
+		v := list[i]
+		group.Rules = append(group.Rules[:v], group.Rules[v+1:]...)
+	}
+}
+
+func (c *Controller) writeFile(groups MultiRuleGroups) (bool, error) {
+
+	filegroup := rulefmt.RuleGroups{}
+	for _, v := range groups.Values {
+		filegroup.Groups = append(filegroup.Groups, v.Groups...)
+	}
+
+	if len(filegroup.Groups) > 0 {
+		rulesyaml, err := yaml.Marshal(filegroup)
 		newSha := c.computeSha1(rulesyaml)
 		if lastSha != newSha {
 			err = c.persistFile(rulesyaml, *rulesLocation)
@@ -314,4 +440,15 @@ func (c *Controller) computeSha1(s []byte) string {
 	hash := sha1.New()
 	hash.Write(s)
 	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+func assembleErrors(myerrors []error) error {
+	errorstring := ""
+	for _, v := range myerrors {
+		errorstring = fmt.Sprintf("%s, %s", errorstring, v)
+	}
+	if len(errorstring) > 0 {
+		return fmt.Errorf(errorstring)
+	}
+	return nil
 }
