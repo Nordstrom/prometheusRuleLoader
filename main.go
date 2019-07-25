@@ -264,12 +264,10 @@ func (c *Controller) extractValues(fallbackNameStub string, data map[string]stri
 			} else {
 				mrg.Values = append(mrg.Values, myrulegroups)
 				myerrors = append(myerrors,err)
-				mrg.Values = append(mrg.Values, myrulegroups)
 			}
 		} else {
 			mrg.Values = append(mrg.Values, myrulegroups)
 			myerrors = append(myerrors,err)
-			mrg.Values = append(mrg.Values, myrulegroups)
 		}
 	}
 
