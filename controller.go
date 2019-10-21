@@ -2,26 +2,26 @@ package main
 
 import (
 	"fmt"
-	"github.com/nordstrom/kubernetes/pkg/api/v1"
 	"gopkg.in/yaml.v2"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
-	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/kubernetes/scheme"
+	"math/rand"
 	"time"
 
 	"github.com/prometheus/prometheus/pkg/rulefmt"
 
 	corev1 "k8s.io/api/core/v1"
-	corev1listers "k8s.io/client-go/listers/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 
@@ -43,6 +43,10 @@ const (
 
 	ErrInvalidKey = "InvalidKey"
 	ValidKey = "ValidKey"
+	letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	letterIdxBits = 6                    // 6 bits to represent a letter index
+	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
+	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
 )
 
 // Controller is the controller implementation for Foo resources
@@ -66,6 +70,7 @@ type Controller struct {
 	resourceVersionMap   map[string]string
 	interestingAnnotation string
 	reloadEndpoint       string
+	randSrc				 *rand.Source
 }
 
 
@@ -88,6 +93,8 @@ func NewController(
 		eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 		recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 
+		rsource := rand.NewSource(time.Now().UnixNano())
+
 		controller := &Controller{
 			kubeclientset:    kubeclientset,
 			configmapsLister: configmapInformer.Lister(),
@@ -96,20 +103,21 @@ func NewController(
 			recorder:         recorder,
 			interestingAnnotation: interestingAnnotation,
 			reloadEndpoint: reloadEndpoint,
+			randSrc: &rsource,
 		}
 
 		klog.Info("Setting up event handlers")
 		configmapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: controller.handleConfigMap,
+			AddFunc: controller.enqueueConfigMap,
 			UpdateFunc: func(old, new interface{}) {
 				newCM := new.(*corev1.ConfigMap)
 				oldCM := old.(*corev1.ConfigMap)
 				if newCM.ResourceVersion == oldCM.ResourceVersion {
 					return
 				}
-				controller.handleConfigMap(newCM)
+				controller.enqueueConfigMap(newCM)
 			},
-			DeleteFunc: controller.handleConfigMap,
+			DeleteFunc: controller.enqueueConfigMap,
 		})
 
 		return controller
@@ -205,65 +213,62 @@ func (c *Controller) processNextWorkItem() bool {
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) error {
 	//// Convert the namespace/name string into a distinct namespace and name
-	//namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	//if err != nil {
-	//	utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
-	//	return nil
-	//}
-	//
-	//// Get the CM resource with this namespace/name
-	//configmap, err := c.configmapsLister.ConfigMaps(namespace).Get(name)
-	//if err != nil {
-	//	// the deployment may have already been deleted
-	//	if errors.IsNotFound(err) {
-	//		utilruntime.HandleError(fmt.Errorf("configmap '%s' in work queue no longer exists", key))
-	//		return nil
-	//	}
-	//
-	//	return err
-	//}
-	//
-	//
-	//
-	//
-	//// Finally, we update the status block of the Foo resource to reflect the
-	//// current state of the world
-	//err = c.updateConfigMapStatus(configmap)
-	//if err != nil {
-	//	return err
-	//}
-	//
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		return nil
+	}
+
+	// Get the CM resource with this namespace/name
+	configmap, err := c.configmapsLister.ConfigMaps(namespace).Get(name)
+	if err != nil {
+		// the deployment may have already been deleted
+		if errors.IsNotFound(err) {
+			utilruntime.HandleError(fmt.Errorf("configmap '%s' in work queue no longer exists", key))
+			return nil
+		}
+
+		return err
+	}
+
+
+	// current implimentation
+	// 1. some configmap changed...
+	// 2. does configmap have annotation
+	// 2b. Get all configmaps clusterwide filter on annotation
+	// 2c. Check each cm resource version against a lookup table
+	// 2d. if there are any misses
+	// 2d1. rebuild config
+
+	if c.isRuleConfigMap(configmap) {
+		mapList, err := c.kubeclientset.CoreV1().ConfigMaps(corev1.NamespaceAll).List(metav1.ListOptions{})
+		if err != nil {
+			klog.Errorf("Unable to collect configmaps from the cluster; %s", err)
+			return nil
+		}
+		if c.haveConfigMapsChanged(mapList) {
+			finalConfig := c.buildFinalConfig(mapList)
+			// write
+			// reload
+		}
+	}
+
+
+
 	//// TODO we might want to do this later
 	//c.recorder.Event(configmap, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
 }
 
-func (c *Controller) handleConfigMap(cm *corev1.ConfigMap) {
-	// current nieve implimentation
-	// 1. Something changed and we have arrived here
-	// 2. Get all configmaps clusterwide filter on annotation
-	// 3. Iterate through each pulling out and validating the rules building a rulesgroups if nessecary
-	// 4. Concat rules groups
-	// 5. Verify unique naming to rules groups
-	// 6. verify hash against last hash
-	// 7. if different write file and reload prometheus
-
-	// potentially better implimentation
-	// 1. something changed...
-	// 2. Get all configmaps clusterwide filter on annotation
-	// 3. get RV for each hit version and create a little fast lookup table `namespace/name`:`resource version`
-	// 4. check the list and see if there are any changes, if so build rules etc
-
-	if c.isRuleConfigMap(cm) {
-		mapList, err := c.kubeclientset.CoreV1().ConfigMaps(v1.NamespaceAll).List(metav1.ListOptions{})
-		if err != nil {
-			klog.Errorf("Unable to collect configmaps from the cluster; %s", err)
-			return
-		}
-		if c.haveConfigMapsChanged(mapList) {
-			finalConfig := c.buildFinalConfig(mapList)
-		}
+// get the cm on the workqueue
+func (c *Controller) enqueueConfigMap(obj interface{}) {
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		utilruntime.HandleError(err)
+		return
 	}
+	c.workqueue.Add(key)
 }
 
 func (c *Controller) buildFinalConfig(mapList *corev1.ConfigMapList) *rulefmt.RuleGroups {
@@ -492,8 +497,32 @@ func (c *Controller) createNameStub(cm *corev1.ConfigMap) string {
 }
 
 func (c *Controller) saltRuleGroupNames(rgs *rulefmt.RuleGroups) *rulefmt.RuleGroups {
-	usedNamed := make(map[string]string)
-	for _, g := range rgs.Groups {
-
+	usedNames := make(map[string]string)
+	for i:=0; i < len(rgs.Groups); i++ {
+		if _, ok := usedNames[rgs.Groups[i].Name]; ok {
+			// used name, salt
+			rgs.Groups[i].Name = fmt.Sprintf("%s-%s", rgs.Groups[i].Name, c.generateRandomString(5))
+		}
+		usedNames[rgs.Groups[i].Name] = "yes"
 	}
+	return rgs
+}
+
+// borrowed from here https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
+func (c *Controller) generateRandomString(n int) string {
+	b := make([]byte, n)
+	src := *c.randSrc
+	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = src.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+
+	return string(b)
 }
