@@ -1,34 +1,21 @@
-// This is a generated file. Do not edit directly.
-
-module k8s.io/sample-controller
+module github.com/nordstrom/prometheusRuleLoader
 
 go 1.12
 
 require (
-	github.com/opentracing/opentracing-go v1.1.0 // indirect
-	github.com/prometheus/client_golang v1.2.1 // indirect
-	github.com/prometheus/prometheus v2.5.0+incompatible
-	github.com/prometheus/tsdb v0.10.0 // indirect
+	github.com/cheekybits/is v0.0.0-20150225183255-68e9c0620927 // indirect
+	github.com/imdario/mergo v0.3.8 // indirect
+	github.com/matryer/try v0.0.0-20161228173917-9ac251b645a2 // indirect
+	github.com/prometheus/common v0.7.0
+	github.com/prometheus/prometheus v0.0.0-20191017095924-6f92ce560538
 	github.com/smartystreets/goconvey v0.0.0-20190731233626-505e41936337
-	gopkg.in/fsnotify.v1 v1.4.7
+	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550 // indirect
+	golang.org/x/time v0.0.0-20190921001708-c4c64cad1fd0 // indirect
+	gopkg.in/matryer/try.v1 v1.0.0-20150601225556-312d2599e12e
 	gopkg.in/yaml.v2 v2.2.4
-	k8s.io/api v0.0.0-20191016225839-816a9b7df678
-	k8s.io/apimachinery v0.0.0-20191016225534-b1267f8c42b4
-	k8s.io/client-go v0.0.0-20191016230210-14c42cd304d9
-	k8s.io/code-generator v0.0.0-20191003035328-700b1226c0bd // indirect
+	k8s.io/api v0.0.0-20190819141258-3544db3b9e44
+	k8s.io/apimachinery v0.0.0-20190817020851-f2f3a405f61d
+	k8s.io/client-go v0.0.0-20190819141724-e14f31a72a77
 	k8s.io/klog v1.0.0
-)
-
-replace (
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20181025213731-e84da0312774
-	golang.org/x/lint => golang.org/x/lint v0.0.0-20181217174547-8f45f776aaf1
-	golang.org/x/oauth2 => golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a
-	golang.org/x/sync => golang.org/x/sync v0.0.0-20181108010431-42b317875d0f
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190209173611-3b5209105503
-	golang.org/x/text => golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
-	golang.org/x/time => golang.org/x/time v0.0.0-20161028155119-f51c12702a4d
-	k8s.io/api => k8s.io/api v0.0.0-20191016225839-816a9b7df678
-	k8s.io/apimachinery => k8s.io/apimachinery v0.0.0-20191016225534-b1267f8c42b4
-	k8s.io/client-go => k8s.io/client-go v0.0.0-20191016230210-14c42cd304d9
-	k8s.io/code-generator => k8s.io/code-generator v0.0.0-20191003035328-700b1226c0bd
+	k8s.io/utils v0.0.0-20191010214722-8d271d903fe4 // indirect
 )
