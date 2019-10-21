@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"gopkg.in/matryer/try.v1"
 	"gopkg.in/yaml.v2"
+	"io/ioutil"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -12,6 +15,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 	"math/rand"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/prometheus/prometheus/pkg/rulefmt"
@@ -68,8 +73,9 @@ type Controller struct {
 	recorder             record.EventRecorder
 
 	resourceVersionMap   map[string]string
-	interestingAnnotation string
-	reloadEndpoint       string
+	interestingAnnotation *string
+	reloadEndpoint       *string
+	configLocation       *string
 	randSrc				 *rand.Source
 }
 
@@ -82,8 +88,9 @@ type MultiRuleGroups struct {
 func NewController(
 	kubeclientset *kubernetes.Clientset,
 	configmapInformer corev1informers.ConfigMapInformer,
-	interestingAnnotation string,
-	reloadEndpoint string,
+	interestingAnnotation *string,
+	reloadEndpoint *string,
+	configPath *string,
 	) *Controller {
 
 		utilruntime.Must(scheme.AddToScheme(scheme.Scheme))
@@ -96,14 +103,15 @@ func NewController(
 		rsource := rand.NewSource(time.Now().UnixNano())
 
 		controller := &Controller{
-			kubeclientset:    kubeclientset,
-			configmapsLister: configmapInformer.Lister(),
-			configmapsSynced: configmapInformer.Informer().HasSynced,
-			workqueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "configmaps"),
-			recorder:         recorder,
-			interestingAnnotation: interestingAnnotation,
-			reloadEndpoint: reloadEndpoint,
-			randSrc: &rsource,
+			kubeclientset:           kubeclientset,
+			configmapsLister:        configmapInformer.Lister(),
+			configmapsSynced:        configmapInformer.Informer().HasSynced,
+			workqueue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "configmaps"),
+			recorder:                recorder,
+			interestingAnnotation:   interestingAnnotation,
+			reloadEndpoint:          reloadEndpoint,
+			configLocation:          rulesLocation,
+			randSrc:                 &rsource,
 		}
 
 		klog.Info("Setting up event handlers")
@@ -209,8 +217,11 @@ func (c *Controller) processNextWorkItem() bool {
 }
 
 // syncHandler compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Foo resource
+// converge the two. It then updates the Status block of the cm resource
 // with the current status of the resource.
+//
+// Only return errors that are transient, a return w/ an error creates a rate
+// limited requeue of the resource.
 func (c *Controller) syncHandler(key string) error {
 	//// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -249,14 +260,15 @@ func (c *Controller) syncHandler(key string) error {
 		if c.haveConfigMapsChanged(mapList) {
 			finalConfig := c.buildFinalConfig(mapList)
 			// write
+			err := c.persistRulesGroup(finalConfig)
+			if err != nil {
+				utilruntime.HandleError(err)
+			}
 			// reload
+			c.tryConfigReload()
 		}
 	}
 
-
-
-	//// TODO we might want to do this later
-	//c.recorder.Event(configmap, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
 }
 
@@ -442,7 +454,7 @@ func (c *Controller) isRuleConfigMap(cm *corev1.ConfigMap) bool {
 	annotations := cm.GetObjectMeta().GetAnnotations()
 
 	for key := range annotations {
-		if key == c.interestingAnnotation {
+		if key == *c.interestingAnnotation {
 			return true
 		}
 	}
@@ -506,6 +518,60 @@ func (c *Controller) saltRuleGroupNames(rgs *rulefmt.RuleGroups) *rulefmt.RuleGr
 		usedNames[rgs.Groups[i].Name] = "yes"
 	}
 	return rgs
+}
+
+func (c *Controller) persistRulesGroup(rulesGroup *rulefmt.RuleGroups) error {
+
+	rulesBytes, err := yaml.Marshal(*rulesGroup)
+	if err != nil {
+		return err
+	}
+
+
+	f, err := os.Create(*c.configLocation)
+	if err != nil {
+		return fmt.Errorf("Unable to open rules file %s for writing. Error: %s", *c.configLocation, err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	byteCount, err := w.WriteString(string(rulesBytes))
+	if err != nil {
+		return fmt.Errorf("Unable to write generated rules. Error: %s", err)
+	}
+	klog.Infof("Wrote %d bytes.\n", byteCount)
+	w.Flush()
+
+	return nil
+}
+
+func (c *Controller) tryConfigReload() {
+	_ = try.Do(func(attempt int) (bool, error) {
+		err := c.configReload(*c.reloadEndpoint)
+		if err != nil {
+			klog.Error(err)
+			time.Sleep(10 * time.Second)
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (c *Controller) configReload(url string) error {
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Unable to reload Prometheus config: %s", err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		klog.Info("Prometheus configuration reloaded.")
+		return nil
+	}
+
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	return fmt.Errorf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
 }
 
 // borrowed from here https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
