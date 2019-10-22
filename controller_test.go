@@ -1,45 +1,59 @@
 package main
 
 import (
+	"fmt"
+	"math/rand"
+	"os"
 	"testing"
 	"gopkg.in/yaml.v2"
+	"time"
 
-	"k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
 
-var c Controller
+const(
+	myAnno = "nordstrom.net/prometheus2alerts"
+)
 
-var testRules []byte
-var testRuleGroup []byte
-var testRuleGroups []byte
 
-var configmapDataBlockRules v1.ConfigMap
-var configmapDataBlockRulesGroup v1.ConfigMap
-var configmapDataBlockRulesGroups v1.ConfigMap
-var configmapDataBlockAllThree v1.ConfigMap
+var (
+	c *Controller
+
+	events *ConfigMapEventContainer
+
+	testRules []byte
+	testRuleGroup []byte
+	testRuleGroups []byte
+
+	configmapDataBlockRules corev1.ConfigMap
+	configmapDataBlockRulesGroup corev1.ConfigMap
+	configmapDataBlockRulesGroups corev1.ConfigMap
+	configmapDataBlockAllThree corev1.ConfigMap
+	configmapNoAnnotation corev1.ConfigMap
+)
+
+type ConfigMapEventContainer struct {
+	Events []ConfigMapEvent
+}
+
+type ConfigMapEvent struct {
+	CMName    	string
+	CMNamespace string
+	Eventtype 	string
+	Message 	string
+	Reason 		string
+}
+
 
 func TestMain(m *testing.M) {
 
-	testRulesObj := []rulefmt.Rule {
-		rulefmt.Rule{
-			Record: "job:http_inprogress_requests:sum",
-			Expr: "sum(http_inprogress_requests) by (job)",
-		},
-		rulefmt.Rule{
-			Alert: "HighErrorRate",
-			Expr: "job:request_latency_seconds:mean5m{job=\"myjob\"} > 0.5",
-			Labels: map[string]string {
-				"severity": "Page",
-			},
-			Annotations: map[string]string {
-				"summary": "High request latency",
-			},
-		},
-	}
+	rsource := rand.NewSource(time.Now().UnixNano())
+
+	testRulesObj := validRulesArray()
 
 	testRuleGroupObj := rulefmt.RuleGroup{
 		Name: "TestGroup",
@@ -68,13 +82,53 @@ func TestMain(m *testing.M) {
 		fmt.Println(err)
 	}
 
+	configmapDataBlockRules = corev1.ConfigMap{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:                       "rules",
+			Namespace:                  "default",
+			Annotations: map[string]string{myAnno: "true"},
+		},
+		Data:       nil,
+	}
+
+	configmapDataBlockRulesGroup = corev1.ConfigMap{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:                       "rules-group",
+			Namespace:                  "default",
+			Annotations: map[string]string{myAnno: "true"},
+		},
+		Data:       nil,
+	}
+
+	configmapDataBlockRulesGroups = corev1.ConfigMap{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:                       "rules-groups",
+			Namespace:                  "default",
+			Annotations: map[string]string{myAnno: "true"},
+		},
+		Data:       nil,
+	}
+
+	configmapDataBlockAllThree = corev1.ConfigMap{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:                       "rules-groups-all-three",
+			Namespace:                  "default",
+			Annotations: map[string]string{myAnno: "true"},
+		},
+		Data:       nil,
+	}
+
+	configmapNoAnnotation = configmapDataBlockRules
+	configmapNoAnnotation.ObjectMeta.Annotations = nil
+
+
 	configmapDataBlockRules.Data = map[string]string{
 		"rules": string(testRules),
 	}
 	configmapDataBlockRulesGroup.Data = map[string]string{
 		"rules": string(testRuleGroup),
 	}
-	configmapDataBlockRulesGroup.Data = map[string]string{
+	configmapDataBlockRulesGroups.Data = map[string]string{
 		"rules": string(testRuleGroup),
 	}
 	configmapDataBlockAllThree.Data = map[string]string{
@@ -82,8 +136,29 @@ func TestMain(m *testing.M) {
 		"bbb": string(testRuleGroup),
 		"ccc": string(testRuleGroups),
 	}
+	configmapNoAnnotation.Data = map[string]string{
+		"rules": string(testRules),
+	}
 
-	c = Controller{}
+	anno := myAnno
+	events = &ConfigMapEventContainer{}
+
+	// just what we need
+	c = &Controller{
+		kubeclientset:         nil,
+		configmapsLister:      nil,
+		configmapsSynced:      nil,
+		workqueue:             nil,
+		recorder:              nil,
+		resourceVersionMap:    make(map[string]string),
+		interestingAnnotation: &anno,
+		reloadEndpoint:        nil,
+		configLocation:        nil,
+		randSrc:               &rsource,
+		configmapEventRecorderFunc: events.Add,
+	}
+
+
 	os.Exit(m.Run())
 }
 
@@ -152,132 +227,351 @@ func TestExtractRulesAsRuleGroups(t *testing.T) {
 }
 
 func TestExtractValues(t *testing.T) {
-	Convey("Test extractValues no matter what of the possible rules formats it should return a good rulesgroups", t, func() {
-		Convey("If we pass it just rules it should return a good rulesgroups", func() {
-			mrg, err := c.extractValues("aaaa-bbbb", configmapDataBlockRules.Data )
-
-			So(err, ShouldBeNil)
-			So(len(mrg.Values), ShouldEqual, 1)
-			So(mrg.Values[0].Groups[0].Name, ShouldEqual, "aaaa-bbbb-rules")
-			So(mrg.Values[0].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-		})
-
-		Convey("If we pass it a rulegroup it should return a good rulesgroups", func() {
-			mrg, err := c.extractValues("aaaa-bbbb", configmapDataBlockRulesGroup.Data )
-
-			So(err, ShouldBeNil)
-			So(len(mrg.Values), ShouldEqual, 1)
-			So(mrg.Values[0].Groups[0].Name, ShouldEqual, "TestGroup")
-			So(mrg.Values[0].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-		})
-
-		Convey("If we pass it a rulegroups it should return a good rulesgroups", func() {
-			mrg, err := c.extractValues("aaaa-bbbb", configmapDataBlockRulesGroup.Data )
-
-			So(err, ShouldBeNil)
-			So(len(mrg.Values), ShouldEqual, 1)
-			So(mrg.Values[0].Groups[0].Name, ShouldEqual, "TestGroup")
-			So(mrg.Values[0].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-		})
-
-		Convey("If we pass it all three we should return three rulesgroups", func() {
-			mrg, err := c.extractValues("aaaa-bbbb", configmapDataBlockAllThree.Data )
-
-			So(err, ShouldBeNil)
-			So(len(mrg.Values), ShouldEqual, 3)
-			So(mrg.Values[0].Groups[0].Name, ShouldEqual, "aaaa-bbbb-aaa")
-			So(mrg.Values[0].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-			So(mrg.Values[1].Groups[0].Name, ShouldEqual, "TestGroup")
-			So(mrg.Values[1].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-			So(mrg.Values[2].Groups[0].Name, ShouldEqual, "TestGroup")
-			So(mrg.Values[2].Groups[0].Rules[0].Record, ShouldEqual, "job:http_inprogress_requests:sum")
-
-		})
-
+	Convey("Presented with a configmap, the proper values should be extracted regardless of formats, where the format is acceptable", t, func() {
+		mrg := c.extractValues(&configmapDataBlockAllThree)
+		So(len(mrg.Values), ShouldEqual, 3)
+		So(countMultiRuleGroupsRules(mrg), ShouldEqual, 6)
 	})
-}
 
+	Convey("Presented with a configmap in the wrong format there should be a warning on the event stream for the configmap", t, func() {
+		events.Clear()
+		cm := corev1.ConfigMap{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:                       "rules",
+				Namespace:                  "default",
+				Annotations: map[string]string{myAnno: "true"},
+			},
+			Data:       nil,
+		}
 
-
-func TestBadRule(t *testing.T) {
-	cm1d := map[string]string{
-		"test": `- record: job:http_inprogress_requests:sum
+		cm.Data = map[string]string{
+			// spacing inside of `` is sacrosanct do not over-format (line 2 should be two spaces indented)
+			"test": `- record: job:http_inprogress_requests:sum
   expr: sum(http_inprogress_requests) by (job)`,
-		"test2": `garbage`,
-		"test3": `- record: fail`,
-	}
-	cm1m := meta_v1.ObjectMeta{
-		Name:        "myconfigmapone",
-		Namespace:   "mynamespace",
-		Annotations: map[string]string{"nordstrom.net/prometheus2Alerts": "true"},
-	}
-	cm1 := v1.ConfigMap{
-		Data:       cm1d,
-		ObjectMeta: cm1m,
-	}
+					"test2": `failNotARule`,
+					"test3": `- record: failNoExpression`,
+				}
 
-	cmList := v1.ConfigMapList{Items: []v1.ConfigMap{cm1}}
-
-	Convey("Processing list of configmaps", t, func() {
-		mrg, err := c.processConfigMaps(&cmList)
-
-		So(err, ShouldNotBeNil)
-		So(len(mrg.Values), ShouldEqual, 2)
-		So(mrg.Values[0].Groups[0].Name, ShouldStartWith, "mynamespace-myconfigmapone-test")
+		mrg := c.extractValues(&cm)
+		So(len(mrg.Values), ShouldEqual, 1)
+		So(countMultiRuleGroupsRules(mrg), ShouldEqual, 1)
+		// 1 key accepted at all
+		So(events.CountNormals(), ShouldEqual, 1)
+		// 1 rule validation failure (test3 record rule)
+		// 1 "key has no rules failure" (test3)
+		// 1 key not parsable failure (test2)
+		So(events.CountWarnings(), ShouldEqual, 3)
 	})
+}
+
+func TestIsRuleConfigMap(t *testing.T) {
+	Convey("Should correctly detect a properly annotated configmap", t, func() {
+		ok := c.isRuleConfigMap(&configmapDataBlockRules)
+		ok2 := c.isRuleConfigMap(&configmapNoAnnotation)
+
+		So(ok, ShouldBeTrue)
+		So(ok2, ShouldBeFalse)
+	})
+}
+
+
+func TestHaveRuleConfigMapsChanged(t *testing.T) {
+	Convey("Should detect if configmaps have changed", t, func() {
+		cm1 := configmapDataBlockAllThree
+		cm2 := configmapDataBlockAllThree
+
+		cm1.ResourceVersion = "0000000001"
+		cm2.ResourceVersion = "0000000001"
+
+		list := corev1.ConfigMapList{Items: []corev1.ConfigMap{cm1, cm2}}
+
+
+		// initial read should be positive
+		changed := c.haveConfigMapsChanged(&list)
+		So(changed, ShouldBeTrue)
+
+		// run it again, should be false (no changes)
+		changed = c.haveConfigMapsChanged(&list)
+		So(changed, ShouldBeFalse)
+
+		// tweak then one last time, RV will change on one should be true
+		list.Items[1].ResourceVersion = "0000000002"
+		changed = c.haveConfigMapsChanged(&list)
+		So(changed, ShouldBeTrue)
+
+
+	})
+}
+
+func TestValidateRuleGroups(t *testing.T) {
 
 }
 
-func TestCreateFile(t *testing.T) {
-	cm1d := map[string]string{"test": `- record: job:http_inprogress_requests:sum
-  expr: sum(http_inprogress_requests) by (job)`}
-	cm1m := meta_v1.ObjectMeta{
-		Name:        "myconfigmapone",
-		Namespace:   "mynamespace",
-		Annotations: map[string]string{"nordstrom.net/prometheus2Alerts": "true"},
+func TestRemoveRules(t *testing.T) {
+	Convey("Should properly remove rules from a rule group by index", t, func() {
+		rgtest := createRuleGroup()
+
+		c.removeRules(&rgtest, []int{0,2})
+		So(len(rgtest.Rules), ShouldEqual, 1)
+		So(rgtest.Rules[0].Record, ShouldEqual, "test1")
+
+		rgtest2 := createRuleGroup()
+		So(len(rgtest2.Rules), ShouldEqual, 3)
+
+		c.removeRules(&rgtest2, []int{1})
+
+		So(len(rgtest2.Rules), ShouldEqual, 2)
+		So(rgtest2.Rules[0].Record, ShouldEqual, "test0")
+		So(rgtest2.Rules[1].Record, ShouldEqual, "test2")
+
+		rgtest3 := createRuleGroup()
+		So(len(rgtest3.Rules), ShouldEqual, 3)
+		c.removeRules(&rgtest3, []int{1,2})
+		So(len(rgtest3.Rules), ShouldEqual, 1)
+		So(rgtest3.Rules[0].Record, ShouldEqual, "test0")
+
+	})
+}
+
+func TestDecomposeMultiRuleGroupIntoRuleGroups(t *testing.T) {
+	Convey("Should properly return a single ruleGroups from a MRG", t, func() {
+		mrgs := createMultiRuleGroups()
+
+		// prelim confirmation
+		So(len(mrgs.Values), ShouldEqual, 2)
+		So(countMultiRuleGroupsRules(mrgs), ShouldEqual, 9)
+
+		rgs := c.decomposeMultiRuleGroupIntoRuleGroups(&mrgs)
+
+		So(len(rgs.Groups), ShouldEqual, 3)
+		So(countRuleGroupsRules(*rgs), ShouldEqual, 9)
+	})
+}
+
+func TestSaltRuleGroupNames(t *testing.T) {
+	Convey("Group names should be unique after salting", t, func() {
+		rgs := createRuleGroups()
+
+		// prelim confirm
+		So(len(rgs.Groups), ShouldEqual, 3)
+		So(countRuleGroupsRules(rgs), ShouldEqual, 9)
+		So(rgs.Groups[0].Name, ShouldEqual, rgs.Groups[1].Name)
+
+		rgs2 := c.saltRuleGroupNames(&rgs)
+		So(rgs2.Groups[0].Name, ShouldNotEqual, rgs2.Groups[1].Name)
+		So(rgs2.Groups[0].Name, ShouldNotEqual, rgs2.Groups[2].Name)
+		So(rgs2.Groups[1].Name, ShouldNotEqual, rgs2.Groups[2].Name)
+
+	})
+}
+
+
+
+//func TestBadRule(t *testing.T) {
+//	cm1d := map[string]string{
+//		"test": `- record: job:http_inprogress_requests:sum
+//  expr: sum(http_inprogress_requests) by (job)`,
+//		"test2": `garbage`,
+//		"test3": `- record: fail`,
+//	}
+//	cm1m := meta_v1.ObjectMeta{
+//		Name:        "myconfigmapone",
+//		Namespace:   "mynamespace",
+//		Annotations: map[string]string{myAnno: "true"},
+//	}
+//	cm1 := corev1.ConfigMap{
+//		Data:       cm1d,
+//		ObjectMeta: cm1m,
+//	}
+//
+//	cmList := corev1.ConfigMapList{Items: []corev1.ConfigMap{cm1}}
+//
+//	Convey("Processing list of configmaps", t, func() {
+//		rgs, err := c.processConfigMapList(&cmList)
+//
+//
+//		So(err, ShouldNotBeNil)
+//		So(len(rgs.Groups), ShouldEqual, 2)
+//		So(rgs.Groups[0].Name, ShouldStartWith, "mynamespace-myconfigmapone-test")
+//	})
+//
+//}
+
+//func TestCreateFile(t *testing.T) {
+//	cm1d := map[string]string{"test": `- record: job:http_inprogress_requests:sum
+//  expr: sum(http_inprogress_requests) by (job)`}
+//	cm1m := meta_v1.ObjectMeta{
+//		Name:        "myconfigmapone",
+//		Namespace:   "mynamespace",
+//		Annotations: map[string]string{myAnno: "true"},
+//	}
+//	cm1 := v1.ConfigMap{
+//		Data:       cm1d,
+//		ObjectMeta: cm1m,
+//	}
+//
+//	cm2d := map[string]string{"test2": `- alert: HighErrorRate
+//  expr: job:request_latency_seconds:mean5m{job="myjob"} > 0.5
+//  for: 10m
+//  labels:
+//    severity: page
+//  annotations:
+//    summary: High request latency`}
+//	cm2m := meta_v1.ObjectMeta{
+//		Name:        "myconfigmaptwo",
+//		Namespace:   "myothernamespace",
+//		Annotations: map[string]string{myAnno: "true"},
+//	}
+//	cm2 := v1.ConfigMap{
+//		Data:       cm2d,
+//		ObjectMeta: cm2m,
+//	}
+//
+//	cm3d := map[string]string{"test3": `Just a normal configmap`}
+//	cm3m := meta_v1.ObjectMeta{
+//		Name:        "configmap_three",
+//		Namespace:   "three",
+//		Annotations: map[string]string{"badannotation": "true"},
+//	}
+//	cm3 := v1.ConfigMap{
+//		Data:       cm3d,
+//		ObjectMeta: cm3m,
+//	}
+//
+//	cmList := v1.ConfigMapList{Items: []v1.ConfigMap{cm1, cm2, cm3}}
+//
+//	Convey("Processing list of configmaps", t, func() {
+//		mrg, err := c.processConfigMaps(&cmList)
+//
+//		So(err, ShouldBeNil)
+//		So(len(mrg.Values), ShouldEqual, 2)
+//		So(mrg.Values[0].Groups[0].Name, ShouldEqual, "mynamespace-myconfigmapone-test")
+//		So(mrg.Values[1].Groups[0].Name, ShouldEqual, "myothernamespace-myconfigmaptwo-test2")
+//	})
+//
+//}
+
+func validRulesArray() []rulefmt.Rule {
+	return []rulefmt.Rule {
+		rulefmt.Rule{
+			Record: "job:http_inprogress_requests:sum",
+			Expr: "sum(http_inprogress_requests) by (job)",
+		},
+		rulefmt.Rule{
+			Alert: "HighErrorRate",
+			Expr: "job:request_latency_seconds:mean5m{job=\"myjob\"} > 0.5",
+			Labels: map[string]string {
+				"severity": "Page",
+			},
+			Annotations: map[string]string {
+				"summary": "High request latency",
+			},
+		},
 	}
-	cm1 := v1.ConfigMap{
-		Data:       cm1d,
-		ObjectMeta: cm1m,
+}
+
+func createRuleGroup() rulefmt.RuleGroup {
+	rg := rulefmt.RuleGroup{
+		Name:     "Test",
+		Interval: 0,
+		Rules:    nil,
 	}
 
-	cm2d := map[string]string{"test2": `- alert: HighErrorRate
-  expr: job:request_latency_seconds:mean5m{job="myjob"} > 0.5
-  for: 10m
-  labels:
-    severity: page
-  annotations:
-    summary: High request latency`}
-	cm2m := meta_v1.ObjectMeta{
-		Name:        "myconfigmaptwo",
-		Namespace:   "myothernamespace",
-		Annotations: map[string]string{"nordstrom.net/prometheus2Alerts": "true"},
-	}
-	cm2 := v1.ConfigMap{
-		Data:       cm2d,
-		ObjectMeta: cm2m,
-	}
-
-	cm3d := map[string]string{"test3": `Just a normal configmap`}
-	cm3m := meta_v1.ObjectMeta{
-		Name:        "configmap_three",
-		Namespace:   "three",
-		Annotations: map[string]string{"badannotation": "true"},
-	}
-	cm3 := v1.ConfigMap{
-		Data:       cm3d,
-		ObjectMeta: cm3m,
-	}
-
-	cmList := v1.ConfigMapList{Items: []v1.ConfigMap{cm1, cm2, cm3}}
-
-	Convey("Processing list of configmaps", t, func() {
-		mrg, err := c.processConfigMaps(&cmList)
-
-		So(err, ShouldBeNil)
-		So(len(mrg.Values), ShouldEqual, 2)
-		So(mrg.Values[0].Groups[0].Name, ShouldEqual, "mynamespace-myconfigmapone-test")
-		So(mrg.Values[1].Groups[0].Name, ShouldEqual, "myothernamespace-myconfigmaptwo-test2")
+	rg.Rules = append(rg.Rules, rulefmt.Rule{
+		Record:      "test0",
+		Expr:        "sum(http_inprogress_requests) by (job, x)",
+		For:         0,
+		Labels:      nil,
+		Annotations: nil,
 	})
 
+	rg.Rules = append(rg.Rules, rulefmt.Rule{
+		Record:      "test1",
+		Expr:        "sum(http_inprogress_requests) by (job, y)",
+		For:         0,
+		Labels:      nil,
+		Annotations: nil,
+	})
+
+	rg.Rules = append(rg.Rules, rulefmt.Rule{
+		Record:      "test2",
+		Expr:        "sum(http_inprogress_requests) by (job, z)",
+		For:         0,
+		Labels:      nil,
+		Annotations: nil,
+	})
+	return rg
+}
+
+func createRuleGroups() rulefmt.RuleGroups {
+	rgs := rulefmt.RuleGroups{}
+	rgs.Groups = append(rgs.Groups, createRuleGroup())
+	rgs.Groups = append(rgs.Groups, createRuleGroup())
+	rgs.Groups = append(rgs.Groups, createRuleGroup())
+
+	return rgs
+}
+
+// returns a mrg of 2 rulegroups, one which has 2 rg the other has 1
+// total of 3 rg and 9 rules
+func createMultiRuleGroups() MultiRuleGroups {
+	rgs0 := rulefmt.RuleGroups{}
+
+	rgs0.Groups = append(rgs0.Groups, createRuleGroup())
+	rgs0.Groups = append(rgs0.Groups, createRuleGroup())
+
+	rgs1 := rulefmt.RuleGroups{}
+
+	rgs1.Groups = append(rgs1.Groups, createRuleGroup())
+
+	mgs := MultiRuleGroups{}
+	mgs.Values = []rulefmt.RuleGroups{rgs0, rgs1}
+
+	return mgs
+}
+
+func countMultiRuleGroupsRules(mrgs MultiRuleGroups) int {
+	count := 0
+	for _, rgs := range mrgs.Values {
+		for _, rg := range rgs.Groups {
+			count += len(rg.Rules)
+		}
+	}
+	return count
+}
+
+func countRuleGroupsRules(rgs rulefmt.RuleGroups) int {
+	count := 0
+	for _, rg := range rgs.Groups {
+		count += len(rg.Rules)
+	}
+	return count
+}
+
+func (ce *ConfigMapEventContainer) Clear() {
+	ce.Events = make([]ConfigMapEvent,0)
+}
+
+func (ce *ConfigMapEventContainer) Add(cm *corev1.ConfigMap, eventtype, reason, msg string) {
+	ce.Events = append(ce.Events, ConfigMapEvent{ cm.Name, cm.Namespace, eventtype, msg, reason})
+}
+
+func (ce *ConfigMapEventContainer) CountWarnings() int {
+	count := 0
+	for _, v := range ce.Events {
+		if v.Eventtype == corev1.EventTypeWarning {
+			count++
+		}
+	}
+	return count
+}
+
+func (ce *ConfigMapEventContainer) CountNormals() int {
+	count := 0
+	for _, v := range ce.Events {
+		if v.Eventtype == corev1.EventTypeNormal {
+			count++
+		}
+	}
+	return count
 }

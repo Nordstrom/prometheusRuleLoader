@@ -77,6 +77,7 @@ type Controller struct {
 	reloadEndpoint       *string
 	configLocation       *string
 	randSrc				 *rand.Source
+	configmapEventRecorderFunc func(cm *corev1.ConfigMap, eventtype,reason, msg string)
 }
 
 
@@ -112,7 +113,11 @@ func NewController(
 			reloadEndpoint:          reloadEndpoint,
 			configLocation:          rulesLocation,
 			randSrc:                 &rsource,
+			resourceVersionMap:      make(map[string]string),
 		}
+
+		// is this idomatic?
+		controller.configmapEventRecorderFunc = controller.recordEventOnConfigMap
 
 		klog.Info("Setting up event handlers")
 		configmapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -254,22 +259,37 @@ func (c *Controller) syncHandler(key string) error {
 	if c.isRuleConfigMap(configmap) {
 		mapList, err := c.kubeclientset.CoreV1().ConfigMaps(corev1.NamespaceAll).List(metav1.ListOptions{})
 		if err != nil {
-			klog.Errorf("Unable to collect configmaps from the cluster; %s", err)
+			utilruntime.HandleError(fmt.Errorf("Unable to collect configmaps from the cluster; %s", err))
 			return nil
 		}
+
 		if c.haveConfigMapsChanged(mapList) {
-			finalConfig := c.buildFinalConfig(mapList)
+			finalrules, err := c.processConfigMapList(mapList)
+			if err != nil {
+				utilruntime.HandleError(err)
+				return nil
+			}
+
 			// write
-			err := c.persistRulesGroup(finalConfig)
+			err = c.persistRulesGroup(finalrules)
 			if err != nil {
 				utilruntime.HandleError(err)
 			}
+
 			// reload
 			c.tryConfigReload()
+
 		}
+
 	}
 
 	return nil
+}
+
+func (c *Controller) processConfigMapList(list *corev1.ConfigMapList) (*rulefmt.RuleGroups, error) {
+	finalConfig := c.buildFinalConfig(list)
+
+	return finalConfig, nil
 }
 
 // get the cm on the workqueue
@@ -307,47 +327,53 @@ func (c *Controller) extractValues(cm *corev1.ConfigMap) (MultiRuleGroups) {
 
 	// make a bucket for random non fully formed rulegroups (just a single rulegroup) to live
 	mrg := MultiRuleGroups{}
+
 	for key, value := range cm.Data {
-		// fallback decoding, first try extracting a RuleGroups, then a RuleGroup, then []Rule
-		err, myrulegroups := c.extractRuleGroups(value)
+		// try each encoding
+		// try to extract a rulegroups
+		var rulegroups rulefmt.RuleGroups
+		var err error
+		err, rulegroups = c.extractRuleGroups(value)
 		if err != nil {
-			// try rulegroup
-			err, myrulegroups := c.extractRuleGroupAsRuleGroups(value)
+			// try to extract a rulegroup as a rulegroups
+			err, rulegroups = c.extractRuleGroupAsRuleGroups(value)
 			if err != nil {
-				// try rules array
-				err, myrulegroups := c.extractRulesAsRuleGroups(fallbackNameStub, key, value)
-				if err != nil {
-					errorMsg := fmt.Sprintf("Configmap: %s key: %s does not conform to any of the legal formats (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key)
-					c.recordWarningOnConfigMap(cm, ErrInvalidKey, errorMsg)
-
-				} else {
-					myrulegroups := c.validateRuleGroups(cm, key, myrulegroups)
-					mrg.Values = append(mrg.Values, myrulegroups)
-					successMessage := fmt.Sprintf("Configmap: %s key: %s Accepted.", fallbackNameStub, key)
-					c.recordWarningOnConfigMap(cm, ValidKey, successMessage)
-				}
-			} else {
-				mrg.Values = append(mrg.Values, myrulegroups)
-				successMessage := fmt.Sprintf("Configmap: %s key: %s Accepted.", fallbackNameStub, key)
-				c.recordWarningOnConfigMap(cm, ValidKey, successMessage)
+				// try to extract a rules array as a rulegroups
+				_, rulegroups = c.extractRulesAsRuleGroups(fallbackNameStub, key, value)
 			}
-		} else {
-			mrg.Values = append(mrg.Values, myrulegroups)
-
-			successMessage := fmt.Sprintf("Configmap: %s key: %s Accepted.", fallbackNameStub, key)
-			c.recordWarningOnConfigMap(cm, ValidKey, successMessage)
 		}
+
+		if len(rulegroups.Groups) == 0 {
+			errorMsg := fmt.Sprintf("Configmap: %s key: %s does not conform to any of the legal formats (RuleGroups, RuleGroup or []Rules. Skipping.", fallbackNameStub, key)
+			c.configmapEventRecorderFunc(cm, corev1.EventTypeWarning, ErrInvalidKey, errorMsg)
+		} else {
+			// validate the rules
+			rulegroups = c.validateRuleGroups(cm, key, rulegroups)
+
+			//if there are groups and rules
+			totalrules := c.countRuleGroupsRules(rulegroups)
+			if len(rulegroups.Groups) > 0 && totalrules > 0 {
+				// append
+				mrg.Values = append(mrg.Values, rulegroups)
+				successMessage := fmt.Sprintf("Configmap: %s key: %s Accepted with %d rulegroups and %d total rules.", fallbackNameStub, key, len(rulegroups.Groups), totalrules)
+				c.configmapEventRecorderFunc(cm, corev1.EventTypeNormal, ValidKey, successMessage)
+			} else {
+				failMessage := fmt.Sprintf("Configmap: %s key: %s Rejected, no valid rules.", fallbackNameStub, key)
+				c.configmapEventRecorderFunc(cm, corev1.EventTypeWarning, ErrInvalidKey, failMessage)
+			}
+		}
+
 	}
 
 	return mrg
 }
+
 
 // for reference
 // from prometheus/pkg/rulefmt/rulefmt.go
 //type RuleGroups struct {
 //	Groups []RuleGroup `yaml:"groups"`
 //}
-
 func (c *Controller) extractRuleGroups(value string) (error, rulefmt.RuleGroups) {
 	groups := rulefmt.RuleGroups{}
 	err := yaml.Unmarshal([]byte(value), &groups)
@@ -420,22 +446,26 @@ func (c *Controller) extractRulesAsRuleGroups(fallbackName string, key string, v
 func (c *Controller) validateRuleGroups(cm *corev1.ConfigMap, keyname string, groups rulefmt.RuleGroups) (rulefmt.RuleGroups) {
 	nameStub := c.createNameStub(cm)
 	// im not using rulegroups.Validate here because i think their current error processing is broken.
-	for _, group := range groups.Groups {
+	for i := 0; i < len(groups.Groups); i++ {
 
-		for i, r := range group.Rules {
+		for j := 0; j < len(groups.Groups[i].Rules); j++ {
 			remove := make([]int,0)
+			r := groups.Groups[i].Rules[j]
+
+			// Validate of any particular rule can return multiple errors
 			for _, err := range r.Validate() {
 				if err != nil {
 					remove = append(remove, i)
 					name := r.Alert
+
+					// recording rules have no names so therefore we'll use the value of "Record" in the error
 					if name == "" {
 						name = r.Record
 					}
-					errorMsg := fmt.Sprintf("Rule failed validation: configmap:%s, key:%s, groupname: %s, rulename: %s Error: %s", nameStub, keyname, group.Name, name, err)
-					c.recorder.Event(cm, corev1.EventTypeWarning, ErrInvalidKey, errorMsg )
-					klog.Warning(errorMsg)
+					errorMsg := fmt.Sprintf("Rule failed validation: Namespace-ConfigMap:%s, Key:%s, GroupName: %s, Rule Name/Record: %s Error: %s", nameStub, keyname, groups.Groups[i].Name, name, err)
+					c.configmapEventRecorderFunc(cm, corev1.EventTypeWarning, ErrInvalidKey, errorMsg)
 				}
-				c.removeRules(&group, remove)
+				c.removeRules(&groups.Groups[i], remove)
 			}
 		}
 	}
@@ -491,14 +521,11 @@ func (c *Controller) decomposeMultiRuleGroupIntoRuleGroups(mrg *MultiRuleGroups)
 	return &finalRuleGroup
 }
 
-func (c *Controller) recordWarningOnConfigMap(cm *corev1.ConfigMap, reason, msg string) {
-	c.recorder.Event(cm, corev1.EventTypeWarning, ErrInvalidKey, msg )
-	klog.Warning(msg)
-}
-
-func (c *Controller) recordSuccessOnConfigMap(cm *corev1.ConfigMap, reason, msg string) {
-	c.recorder.Event(cm, corev1.EventTypeNormal, ErrInvalidKey, msg )
-	klog.Warning(msg)
+func (c *Controller) recordEventOnConfigMap(cm *corev1.ConfigMap, eventtype, reason, msg string) {
+	c.recorder.Event(cm, eventtype, reason, msg )
+	if eventtype == corev1.EventTypeWarning {
+		klog.Warning(msg)
+	}
 }
 
 func (c *Controller) createNameStub(cm *corev1.ConfigMap) string {
@@ -572,6 +599,14 @@ func (c *Controller) configReload(url string) error {
 
 	respBody, _ := ioutil.ReadAll(resp.Body)
 	return fmt.Errorf("Unable to reload the Prometheus config. Endpoint: %s, Reponse StatusCode: %d, Response Body: %s", url, resp.StatusCode, string(respBody))
+}
+
+func (c *Controller) countRuleGroupsRules(rgs rulefmt.RuleGroups) int {
+	count := 0
+	for _, rg := range rgs.Groups {
+		count += len(rg.Rules)
+	}
+	return count
 }
 
 // borrowed from here https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
