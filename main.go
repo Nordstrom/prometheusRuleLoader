@@ -20,7 +20,7 @@ var (
 	// flags general
 	helpFlag            = flag.Bool("help", false, "")
 	configmapAnnotation = flag.String("annotation", "nordstrom.net/prometheus2Alerts", "Annotation that states that this configmap contains prometheus rules.")
-	rulesLocation       = flag.String("rulespath", "/rules", "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
+	rulesPath           = flag.String("rulespath", "/rules", "Filepath where the rules from the configmap file should be written, this should correspond to a rule_files: location in your prometheus config.")
 	reloadEndpoint      = flag.String("endpoint", "http://localhost:9090/-/reload/", "Endpoint of the Prometheus reset endpoint (eg: http://prometheus:9090/-/reload).")
 	batchTime           = flag.Int("batchtime", 5, "Time window to batch updates (in seconds, default: 5)")
 	// flags - kubeclient
@@ -45,7 +45,7 @@ func main() {
 
 	if *helpFlag ||
 		*configmapAnnotation == "" ||
-		*rulesLocation == "" ||
+		*rulesPath == "" ||
 		*reloadEndpoint == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -53,7 +53,7 @@ func main() {
 
 	log.Printf("Rule Updater starting.\n")
 	log.Printf("ConfigMap annotation: %s\n", *configmapAnnotation)
-	log.Printf("Rules location: %s\n", *rulesLocation)
+	log.Printf("Rules location: %s\n", *rulesPath)
 
 	// set up signals so we handle the first shutdown signal gracefully
 	stopCh := signals.SetupSignalHandler()
@@ -70,7 +70,7 @@ func main() {
 
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 
-	controller := NewController(kubeClient, kubeInformerFactory.Core().V1().ConfigMaps(), configmapAnnotation, reloadEndpoint, rulesLocation)
+	controller := NewController(kubeClient, kubeInformerFactory.Core().V1().ConfigMaps(), configmapAnnotation, reloadEndpoint, rulesPath)
 
 	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
 	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.

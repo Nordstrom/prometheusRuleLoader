@@ -33,19 +33,6 @@ import (
 const (
 	controllerAgentName = "prometheus-rule-loader-controller"
 
-	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
-	SuccessSynced = "Synced"
-	// ErrResourceExists is used as part of the Event 'reason' when a Foo fails
-	// to sync due to a Deployment of the same name already existing.
-	ErrResourceExists = "ErrResourceExists"
-
-	// MessageResourceExists is the message used for Events when a resource
-	// fails to sync due to a Deployment already existing
-	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
-	// MessageResourceSynced is the message used for an Event fired when a Foo
-	// is synced successfully
-	MessageResourceSynced = "Foo synced successfully"
-
 	ErrInvalidKey = "InvalidKey"
 	ValidKey = "ValidKey"
 	letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -72,11 +59,11 @@ type Controller struct {
 	// Kubernetes API.
 	recorder             record.EventRecorder
 
-	resourceVersionMap   map[string]string
-	interestingAnnotation *string
-	reloadEndpoint       *string
-	configLocation       *string
-	randSrc				 *rand.Source
+	resourceVersionMap         map[string]string
+	interestingAnnotation      *string
+	reloadEndpoint             *string
+	rulesPath                  *string
+	randSrc                    *rand.Source
 	configmapEventRecorderFunc func(cm *corev1.ConfigMap, eventtype,reason, msg string)
 }
 
@@ -91,7 +78,7 @@ func NewController(
 	configmapInformer corev1informers.ConfigMapInformer,
 	interestingAnnotation *string,
 	reloadEndpoint *string,
-	configPath *string,
+	rulesPath *string,
 	) *Controller {
 
 		utilruntime.Must(scheme.AddToScheme(scheme.Scheme))
@@ -104,16 +91,16 @@ func NewController(
 		rsource := rand.NewSource(time.Now().UnixNano())
 
 		controller := &Controller{
-			kubeclientset:           kubeclientset,
-			configmapsLister:        configmapInformer.Lister(),
-			configmapsSynced:        configmapInformer.Informer().HasSynced,
-			workqueue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "configmaps"),
-			recorder:                recorder,
-			interestingAnnotation:   interestingAnnotation,
-			reloadEndpoint:          reloadEndpoint,
-			configLocation:          rulesLocation,
-			randSrc:                 &rsource,
-			resourceVersionMap:      make(map[string]string),
+			kubeclientset:         kubeclientset,
+			configmapsLister:      configmapInformer.Lister(),
+			configmapsSynced:      configmapInformer.Informer().HasSynced,
+			workqueue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "configmaps"),
+			recorder:              recorder,
+			interestingAnnotation: interestingAnnotation,
+			reloadEndpoint:        reloadEndpoint,
+			rulesPath:             rulesPath,
+			randSrc:               &rsource,
+			resourceVersionMap:    make(map[string]string),
 		}
 
 		// is this idomatic?
@@ -264,7 +251,7 @@ func (c *Controller) syncHandler(key string) error {
 		}
 
 		if c.haveConfigMapsChanged(mapList) {
-			finalrules, err := c.processConfigMapList(mapList)
+			finalrules := c.buildFinalConfig(mapList)
 			if err != nil {
 				utilruntime.HandleError(err)
 				return nil
@@ -286,11 +273,6 @@ func (c *Controller) syncHandler(key string) error {
 	return nil
 }
 
-func (c *Controller) processConfigMapList(list *corev1.ConfigMapList) (*rulefmt.RuleGroups, error) {
-	finalConfig := c.buildFinalConfig(list)
-
-	return finalConfig, nil
-}
 
 // get the cm on the workqueue
 func (c *Controller) enqueueConfigMap(obj interface{}) {
@@ -555,9 +537,9 @@ func (c *Controller) persistRulesGroup(rulesGroup *rulefmt.RuleGroups) error {
 	}
 
 
-	f, err := os.Create(*c.configLocation)
+	f, err := os.Create(*c.rulesPath)
 	if err != nil {
-		return fmt.Errorf("Unable to open rules file %s for writing. Error: %s", *c.configLocation, err)
+		return fmt.Errorf("Unable to open rules file %s for writing. Error: %s", *c.rulesPath, err)
 	}
 	defer f.Close()
 

@@ -145,16 +145,16 @@ func TestMain(m *testing.M) {
 
 	// just what we need
 	c = &Controller{
-		kubeclientset:         nil,
-		configmapsLister:      nil,
-		configmapsSynced:      nil,
-		workqueue:             nil,
-		recorder:              nil,
-		resourceVersionMap:    make(map[string]string),
-		interestingAnnotation: &anno,
-		reloadEndpoint:        nil,
-		configLocation:        nil,
-		randSrc:               &rsource,
+		kubeclientset:              nil,
+		configmapsLister:           nil,
+		configmapsSynced:           nil,
+		workqueue:                  nil,
+		recorder:                   nil,
+		resourceVersionMap:         make(map[string]string),
+		interestingAnnotation:      &anno,
+		reloadEndpoint:             nil,
+		rulesPath:                  nil,
+		randSrc:                    &rsource,
 		configmapEventRecorderFunc: events.Add,
 	}
 
