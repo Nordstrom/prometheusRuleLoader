@@ -4,6 +4,7 @@ Handy Kubernetes sidecar for Prometheus 2.x. It watches for configmaps in all na
 
 Changes
 =======
+* New 5.0 version, no breaking changes. Some work to reduce churn, added an event recorder, configmaps will get events if keys are successfully loaded or not. Brought up to spec with the current kubernetes sample controller. If it finds two RuleGroup(s) with the same name it will automatically salt the name of the duplicate in the final configmap.
 * New 3.0 version, breaking changes! This works with the new prometheus 2 rules only, if you want to use the rule loader with prometheus 1.x please use the `prom1.x-stable` tag.
 
 Parameters
