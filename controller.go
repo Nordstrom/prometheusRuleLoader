@@ -225,32 +225,40 @@ func (c *Controller) syncHandler(key string) error {
 	// Get the CM resource with this namespace/name
 	configmap, err := c.configmapsLister.ConfigMaps(namespace).Get(name)
 	if err != nil {
-		// the deployment may have already been deleted
+		// the cm may have already been deleted
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("configmap '%s' in work queue no longer exists", key))
-			return nil
+			utilruntime.HandleError(fmt.Errorf("configmap '%s' in work queue no longer exists, rebuilding rules config", key))
+		} else {
+			return err
 		}
-
-		return err
 	}
 
 
 	// current implimentation
 	// 1. some configmap changed...
+	// 1b. If it was nil (deleted) we have no choice but to rebuild skip to 2d1.
 	// 2. does configmap have annotation
 	// 2b. Get all configmaps clusterwide filter on annotation
 	// 2c. Check each cm resource version against a lookup table
 	// 2d. if there are any misses
 	// 2d1. rebuild config
 
-	if c.isRuleConfigMap(configmap) {
+	// I don't love this bypass
+	bypassCheck := false
+
+	if configmap == nil {
+		// deleted
+		bypassCheck = true
+	}
+
+	if c.isRuleConfigMap(configmap) || bypassCheck {
 		mapList, err := c.kubeclientset.CoreV1().ConfigMaps(corev1.NamespaceAll).List(metav1.ListOptions{})
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("Unable to collect configmaps from the cluster; %s", err))
 			return nil
 		}
 
-		if c.haveConfigMapsChanged(mapList) {
+		if c.haveConfigMapsChanged(mapList) || bypassCheck {
 			finalrules := c.buildFinalConfig(mapList)
 			if err != nil {
 				utilruntime.HandleError(err)
@@ -463,6 +471,9 @@ func (c *Controller) removeRules(group *rulefmt.RuleGroup, list []int) {
 }
 
 func (c *Controller) isRuleConfigMap(cm *corev1.ConfigMap) bool {
+	if cm == nil {
+		return false
+	}
 	annotations := cm.GetObjectMeta().GetAnnotations()
 
 	for key := range annotations {
