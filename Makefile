@@ -1,6 +1,6 @@
 app_name := prometheusRuleLoader
 container_name := prometheusruleloader
-container_registry := gitlab-registry.nordstrom.com/k8s/platform-bootstrap
+container_registry := artifactory.nordstrom.com/docker/app00738
 container_release := 5.1
 
 .PHONY: build tag/image push/image clean
